@@ -306,6 +306,7 @@ def _silu_and_mul_post_quant_kernel(
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -342,6 +343,10 @@ def _silu_and_mul_post_quant_kernel(
             mask=offs_in_d < size_n,
             other=0.0,
         )
+        # Fused swiglu_limit clamp (avoids separate elementwise kernel)
+        if SWIGLU_LIMIT > 0.0:
+            gate = tl.clamp(gate, -SWIGLU_LIMIT, SWIGLU_LIMIT)
+            up = tl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
         gate = gate / (1 + tl.exp(-gate))
         gate = gate.to(input_ptr.dtype.element_ty)
         gate_up = up * gate
@@ -370,6 +375,7 @@ def silu_and_mul_masked_post_quant_fwd(
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
+    swiglu_limit: float = 0.0,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim]
@@ -427,6 +433,7 @@ def silu_and_mul_masked_post_quant_fwd(
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
+        SWIGLU_LIMIT=swiglu_limit,
     )
     return
 
@@ -1173,6 +1180,49 @@ def fill_gateup_input_triton_kernel(
                     tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
 
 
+@triton.jit
+def _per_token_group_quant_fp8_pow2_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    M, K, group_size: tl.constexpr,
+    fp8_max: tl.constexpr,
+    BLOCK_GROUP: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    num_groups = K // group_size
+
+    if pid_m >= M or pid_g >= num_groups:
+        return
+
+    offs = tl.arange(0, BLOCK_GROUP)
+    x_base = pid_m * K + pid_g * group_size
+    x = tl.load(x_ptr + x_base + offs, mask=offs < group_size).to(tl.float32)
+
+    absmax = tl.max(tl.abs(x))
+    absmax = tl.maximum(absmax, 1e-10)
+    raw_scale = absmax / fp8_max
+    # Round up to next power of 2: 2^ceil(log2(x))
+    scale = tl.exp2(tl.ceil(tl.math.log2(raw_scale)))
+    inv_scale = 1.0 / scale
+
+    out = tl.clamp(x * inv_scale, -fp8_max, fp8_max).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + x_base + offs, out, mask=offs < group_size)
+    tl.store(scale_ptr + pid_m * num_groups + pid_g, scale)
+
+
+def _per_token_group_quant_fp8_pow2(x, group_size):
+    M, K = x.shape
+    num_groups = K // group_size
+    x_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    x_s = torch.empty(M, num_groups, device=x.device, dtype=torch.float32)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    grid = (M, num_groups)
+    _per_token_group_quant_fp8_pow2_kernel[grid](
+        x, x_q, x_s, M, K, group_size, fp8_max, BLOCK_GROUP=group_size,
+    )
+    return x_q, x_s
+
+
 def moe_ep_deepgemm_preprocess(
     topk_ids: torch.Tensor,
     num_local_experts: int,
@@ -1221,7 +1271,18 @@ def moe_ep_deepgemm_preprocess(
     is_fp8 = output_dtype == torch.float8_e4m3fn
     if is_fp8:
         # TODO: fuse this with the preprocess
-        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+
+        if DEEPGEMM_SCALE_UE8M0:
+            # Quantize with pow2 (UE8M0) scales so FP8 values are consistent
+            # with DeepGEMM's dequant.
+            hidden_states, scale = _per_token_group_quant_fp8_pow2(
+                hidden_states, block_k
+            )
+        else:
+            hidden_states, scale = per_token_group_quant_fp8(
+                hidden_states, block_k
+            )
 
         gateup_input_scale = torch.empty(
             (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
