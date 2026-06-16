@@ -104,8 +104,11 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
+        from sglang.srt.server_args import get_global_server_args
+
+        use_fp4_indexer = get_global_server_args().enable_deepseek_v4_fp4_indexer
         if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            (envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer)
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
         ):
             self.deep_gemm_metadata = None
@@ -113,8 +116,11 @@ class PagedIndexerMetadata:
             import deep_gemm
 
             use_jit_indexer = (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                not use_fp4_indexer
+                and (
+                    envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                    or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                )
             )
             if use_jit_indexer:
                 from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
