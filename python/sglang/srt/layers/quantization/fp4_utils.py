@@ -10,7 +10,6 @@ from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
     is_sm100_supported,
-    is_sm120_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
@@ -95,7 +94,6 @@ class Fp4GemmRunnerBackend(Enum):
     """Enum for FP4 GEMM runner backend selection."""
 
     AUTO = "auto"
-    CUTLASS = "cutlass"
     FLASHINFER_CUDNN = "flashinfer_cudnn"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
@@ -104,9 +102,6 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
-
-    def is_cutlass(self) -> bool:
-        return self == Fp4GemmRunnerBackend.CUTLASS
 
     def is_flashinfer_cudnn(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_CUDNN
@@ -153,12 +148,7 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
 
     backend = server_args.fp4_gemm_runner_backend
     if backend == "auto":
-        if is_sm120_supported():
-            # flashinfer_cutlass produces NaN in dense MLP layers with
-            # heterogeneous batches on SM120 (Blackwell).  cudnn is stable.
-            # See: https://github.com/sgl-project/sglang/issues/20043
-            backend = "flashinfer_cudnn"
-        elif is_sm100_supported():
+        if is_sm100_supported():
             backend = "flashinfer_cutedsl"
         elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
             backend = "marlin"

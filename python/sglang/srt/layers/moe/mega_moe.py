@@ -31,9 +31,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.models.deepseek_common.utils import _device_sm
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.model_executor.runner import get_is_capture_mode
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -165,61 +163,7 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def _ensure_mega_moe_symm_buffer(moe: "DeepseekV2MoE") -> SymmBuffer:
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
-    return _get_mega_moe_symm_buffer(
-        get_moe_ep_group().device_group,
-        num_experts=moe.experts.num_experts,
-        num_max_tokens_per_rank=(
-            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-        ),
-        num_topk=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
-        hidden=moe.config.hidden_size,
-        intermediate_hidden=moe.config.moe_intermediate_size,
-    )
-
-
-def _get_dp_global_num_tokens_or_none() -> Optional[list[int]]:
-    try:
-        return get_dp_global_num_tokens()
-    except AttributeError:
-        return None
-
-
-def _deep_gemm_supports_mega_moe_config(config: _MegaMoeArchConfig) -> bool:
-    try:
-        import deep_gemm
-    except ImportError:
-        return False
-    return hasattr(deep_gemm, config.deep_gemm_entry)
-
-
-def _get_effective_num_tokens(config: _MegaMoeArchConfig, num_tokens: int) -> int:
-    if not config.use_dp_max_tokens:
-        return num_tokens
-    global_num_tokens = _get_dp_global_num_tokens_or_none()
-    if not global_num_tokens:
-        effective_num_tokens = num_tokens
-    else:
-        effective_num_tokens = max(max(global_num_tokens), num_tokens)
-    if (
-        0 < effective_num_tokens < config.pre_dispatch_group_size
-        and _get_disaggregation_mode_or_none() == "prefill"
-    ):
-        return config.pre_dispatch_group_size
-    return effective_num_tokens
-
-
-
-def _get_disaggregation_mode_or_none() -> Optional[str]:
-    try:
-        return getattr(get_global_server_args(), "disaggregation_mode", None)
-    except ValueError:
-        return None
-
-
-def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
+def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
@@ -238,9 +182,9 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
 
 
 def forward_mega_moe(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"] = None,
+    forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
@@ -275,9 +219,9 @@ def forward_mega_moe(
 
 
 def _run_mega_routed(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"],
+    forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
@@ -457,22 +401,42 @@ def _run_mega_routed(
     return y
 
 
-def _interleave_l1_weight_only(weight: torch.Tensor, gran: int = 8) -> torch.Tensor:
-    num_groups, n, *rest = weight.shape
+def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    # Match DeepGEMM's L1 gate/up layout:
+    # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...].
+    num_groups, n, *rest = t.shape
     half = n // 2
-    gate = weight[:, :half].reshape(num_groups, half // gran, gran, *rest)
-    up = weight[:, half:].reshape(num_groups, half // gran, gran, *rest)
-    return torch.empty_like(weight).copy_(
-        torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
+    gate = t[:, :half].reshape(num_groups, half // gran, gran, *rest)
+    up = t[:, half:].reshape(num_groups, half // gran, gran, *rest)
+    result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
+    return torch.empty_like(t).copy_(result)
+
+
+def _interleave_mega_moe_l1_weights(
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        _interleave_mega_moe_gate_up(l1_weights[0]),
+        _interleave_mega_moe_gate_up(l1_weights[1]),
     )
 
 
-def build_mega_moe_experts_weights(experts) -> bool:
+def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
+    num_groups, mn, packed_sf_k = sf.shape
+    assert sf.dtype == torch.int and mn % 128 == 0
+    result = (
+        sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
+        .transpose(2, 3)
+        .reshape(num_groups, mn, packed_sf_k)
+    )
+    return torch.empty_like(sf).copy_(result)
+
+
+def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
     )
-    from deep_gemm.mega import _interleave_l1_weights, _transpose_sf_for_utccp
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return _get_built_mega_moe_arch_config(experts) is not None
@@ -519,12 +483,19 @@ def build_mega_moe_experts_weights(experts) -> bool:
         f"expected {expected_k_groups_2} (k2={k2}, group_k={scale_group_k})"
     )
 
-    fix_mega_moe_memory = envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get()
-    if fix_mega_moe_memory and config.name == _SM90_FP8_CONFIG.name:
-        # SM90 shares both fp8 weights and block-(128, 128) FP32 scales with the
-        # DeepEP grouped-GEMM path. SM90 has no UTCCP scale transpose, and its
-        # scale tensors stay in checkpoint layout.
-        w13_interleaved = _interleave_l1_weight_only(w13)
+    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        # Build the interleaved L1 weight + scale once; share the weight buffer
+        # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
+        # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
+        # the deep-ep path consumes the non-transposed interleaved scale and a
+        # swizzle-aware activation kernel. L2 weight is untouched by the mega
+        # transform, so the existing `w2_weight.data` is shared directly.
+        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+            (w13, w13_sf)
+        )
+        w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
+        w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
+
         experts.w13_weight.data = w13_interleaved
         experts.mega_l1_weights = (
             experts.w13_weight.data,
