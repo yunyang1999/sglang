@@ -1579,6 +1579,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
+            if (
+                not self.is_fp4_expert
+                and get_moe_a2a_backend().is_megamoe()
+                and is_sm90_supported()
+                and not is_sm100_supported()
+            ):
+                from sglang.srt.layers.moe.mega_moe import (
+                    build_mega_moe_experts_weights,
+                )
+
+                build_mega_moe_experts_weights(layer)
+                return
+
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
                 if requant_block_scale_ue8m0_for_deepgemm(
