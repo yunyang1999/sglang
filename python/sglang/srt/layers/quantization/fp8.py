@@ -2032,7 +2032,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+            layer.dispatcher.set_quant_config(
+                {
+                    "weight_dtype": layer.w13_weight.dtype,
+                    "is_fp4_experts": self.is_fp4_expert,
+                }
+            )
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added

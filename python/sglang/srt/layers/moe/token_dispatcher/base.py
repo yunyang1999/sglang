@@ -27,6 +27,8 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        EpV2CombineInput,
+        EpV2DispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -157,6 +159,12 @@ class DispatchOutputChecker:
     ) -> TypeGuard[FlashinferDispatchOutput]:
         return dispatch_output.format.is_flashinfer()
 
+    @staticmethod
+    def format_is_epv2(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[EpV2DispatchOutput]:
+        return dispatch_output.format.is_epv2()
+
 
 class DispatchOutputFormat(Enum):
 
@@ -164,6 +172,7 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    EPV2 = "epv2"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -182,6 +191,9 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_epv2(self) -> bool:
+        return self == DispatchOutputFormat.EPV2
 
 
 @runtime_checkable
@@ -231,12 +243,19 @@ class CombineInputChecker:
     ) -> TypeGuard[FlashinferCombineInput]:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
+    @staticmethod
+    def format_is_epv2(
+        combine_input: CombineInput,
+    ) -> TypeGuard[EpV2CombineInput]:
+        return combine_input.format == CombineInputFormat.EPV2
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    EPV2 = "epv2"
 
 
 @runtime_checkable

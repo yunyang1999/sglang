@@ -264,7 +264,7 @@ class DeepEPBuffer:
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            allow_mnnvl=use_mnnvl_fabric,
+            allow_mnnvl=envs.SGLANG_DEEPEP_ALLOW_MNNVL.get() and use_mnnvl_fabric,
         )
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use

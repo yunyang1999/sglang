@@ -6,6 +6,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_musa,
     is_sm100_supported,
+    is_sm120_supported,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,10 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
+# DeepGEMM PR #324 supports the Blackwell-family MXFP4 path on both SM100
+# and SM120. The path expects packed UE8M0 scale tensors for FP8/FP4 GEMMs.
+DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and (
+    is_sm100_supported() or is_sm120_supported()
+)
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
