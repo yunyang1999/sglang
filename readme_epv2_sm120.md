@@ -1,113 +1,100 @@
-# DeepEP v2 / EPv2 SM120 集成
+# DeepEP v2 / EPv2 SM120 集成与验证
 
-本文记录 SGLang 中 `epv2` 后端在 **SM120 / 纯 PCIe / 无 NVL** 机器上的集成、部署和验证结果。当前验证机器为 **5k10**：`10.6.142.10`，工作目录 `/root/menyu`，容器 `sglang_epv2_5k10_menyu`，SGLang 工作树 `/root/menyu/sglang_epv2`。
+本文记录 SGLang `deepep_v2` 后端在 **SM120、8 卡、纯 PCIe、无 NVL**
+节点上的集成、部署、正确性和性能结果。本文只覆盖：
 
-本文三部分：**一、部署配置  二、运行方式与测试数据  三、代码修改与优化总结**。
+- 模型：DeepSeek-V4-Flash。
+- MoE runner：DeepGEMM。
+- Dispatcher output：FP8。
+- EPv2 通信模式：`direct`。
+- 当前验证节点：5k11（`10.6.142.11`）。
+- 当前容器：`5k11_epv2_sm120_sync`。
+- 当前工作树：`/root/menyu/sglang_epv2_sm120_sync`。
+
+当前 SM120 分支基于：
+
+```text
+origin/epv2-deepep-v2-backend@a791257700
+```
+
+旧 SM120 分支使用过 psum-contiguous decode 实验路径。当前版本已经与最新
+`epv2-deepep-v2-backend` 对齐：prefill/extend 使用 contiguous adapter，decode
+使用 expanded dispatch + masked DeepGEMM adapter。旧性能表不能与当前结果直接混用。
 
 ---
 
-## 一、部署配置
+## 1. 支持范围
 
-### 1.1 目标分支
+| 配置 | 状态 | 说明 |
+| --- | --- | --- |
+| `deepep_v2 + direct + fp8 + deep_gemm` | 已验证 | 本分支主线 |
+| `deepep_v2 + hybrid` | 未验证 | SM120 纯 PCIe 节点当前只调优 direct |
+| Triton / BF16 runner | 未验证 | 本轮只验证 DeepGEMM |
+| CUDA graph | 未纳入性能矩阵 | 本文数据均显式关闭 graph |
+| MegaMoE | 不涉及 | EPv2 不调用 MegaMoE kernel，也不使用 swizzled gate/up layout |
 
-SM120 专用整理分支：
+EPv2 是独立 MoE A2A backend，不复用 legacy DeepEP normal/low-latency dispatcher、
+handle 或 dispatch/combine 数据结构。
 
-```bash
-git clone -b epv2-integration-sm120 https://github.com/MengYu10151/sglang.git
-cd sglang
-pip install -e python
-```
+---
 
-本分支基于 `epv2-integration`，保留 `epv2` 作为独立 MoE A2A backend，不复用 legacy `deepep` 的 dispatcher、mode 语义或 dispatch/combine 数据结构。
+## 2. 依赖与运行环境
 
-### 1.2 硬件与容器
-
-- GPU：SM120，8 卡，纯 PCIe / 无 NVL。
-- 当前验证节点：5k10，`10.6.142.10`。
-- Docker：`sglang_epv2_5k10_menyu`。
-- 容器建议参数：`--privileged --network host --ipc host --shm-size 64g --gpus all`。
-- 模型目录：`/root/menyu/models/DeepSeek-V4-Flash`。
-
-### 1.3 NCCL 2.30.7
-
-当前 5k10 使用官方 NCCL 2.30.7 clean build：
+### 2.1 容器建议
 
 ```bash
-/root/menyu/nccl                         # git branch: v2.30.7-official-clean
-/usr/local/nccl-v2307-official           # installed NCCL_HOME
+docker run --privileged --network host --ipc host \
+  --shm-size 64g --gpus all ...
 ```
 
-运行期环境：
-
-```bash
-export NCCL_HOME=/usr/local/nccl-v2307-official
-export CPATH=/usr/local/nccl-v2307-official/include:${CPATH:-}
-export LIBRARY_PATH=/usr/local/nccl-v2307-official/lib:${LIBRARY_PATH:-}
-export LD_LIBRARY_PATH=/usr/local/nccl-v2307-official/lib:${LD_LIBRARY_PATH:-}
-```
-
-本 SM120 EPv2 direct 验证不依赖 NCCL-EP patch；这里使用的是官方 NCCL 2.30.7。
-
-### 1.4 DeepEP v2
-
-当前验证使用 DeepEP v2 源码：
-
-```bash
-/root/menyu/DeepEP_epv2
-commit d4f41e4
-```
-
-安装方式：
-
-```bash
-cd /root/menyu/DeepEP_epv2
-TORCH_CUDA_ARCH_LIST=12.0 python setup.py bdist_wheel
-pip install dist/*.whl --force-reinstall --no-deps
-```
-
-验证：
-
-```bash
-python3 - <<'PY'
-from deep_ep import ElasticBuffer
-import deep_ep
-print(deep_ep.__file__)
-PY
-```
-
-### 1.5 DeepGEMM PR #324
-
-SM120 / MXFP4 路径依赖 DeepGEMM PR #324，当前独立安装并优先于 SGLang vendored/import path：
-
-```bash
-/root/menyu/DeepGEMM_pr324
-commit aced12c2
-```
-
-验证：
-
-```bash
-python3 - <<'PY'
-import deep_gemm
-print(deep_gemm.__file__)
-PY
-```
-
-当前 5k10 输出：
+模型目录：
 
 ```text
-/root/menyu/DeepGEMM_pr324/deep_gemm/__init__.py
+/root/menyu/models/DeepSeek-V4-Flash
 ```
 
-### 1.6 运行期环境变量
+### 2.2 NCCL
 
-当前 5k10 env 文件：
+本轮 server 显式加载自编译 NCCL：
+
+```text
+source: /root/menyu/nccl
+HEAD:   28b9118fee74761c2e892f73a00713863891a4e7
+lib:    /root/menyu/nccl/build/lib
+```
+
+启动时必须确保：
 
 ```bash
-/root/menyu/epv2_env.sh
+export LD_LIBRARY_PATH=/root/menyu/nccl/build/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 ```
 
-关键配置：
+当前源码工作树含本地 NCCL/EP 调试改动，正式发布前需要把 NCCL 二进制来源整理成
+可复现的 clean commit 或安装脚本。EPv2 SM120 direct 验证不依赖 NCCL-EP backend，
+但依赖 NCCL symmetric-memory/RDMA 运行能力。
+
+### 2.3 DeepEP v2
+
+```text
+source: /root/menyu/DeepEP_b306af0
+commit: b306af06afd412c88e51e71802951606e40b7358
+import: /root/menyu/DeepEP_b306af0/deep_ep/__init__.py
+```
+
+### 2.4 DeepGEMM SM120
+
+使用 DeepGEMM PR #324 的 SM120/MXFP4 实现：
+
+```text
+source: /root/menyu/dg-sm120
+commit: aced12c2c8882a945c568ace9d4a7e5778aae410
+import: /usr/local/lib/python3.12/dist-packages/deep_gemm/__init__.py
+torch:  2.11.0+cu130
+```
+
+独立安装的 `deep_gemm` 优先于 SGLang vendored 版本。
+
+### 2.5 纯 PCIe/RDMA 环境
 
 ```bash
 export NVSHMEM_BOOTSTRAP=UID
@@ -121,46 +108,86 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_LSA_TEAM_SIZE=1
 export NCCL_NET_MERGE_LEVEL=LOC
 export NCCL_NVLS_ENABLE=0
-
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-export SGLANG_ENABLE_JIT_DEEPGEMM=1
-export SGLANG_DSV4_FP4_EXPERTS=1
-export SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
-export SGLANG_EPV2_NUM_SMS=8
 ```
 
-`NCCL_LSA_TEAM_SIZE=1` 和 `NCCL_NET_MERGE_LEVEL=LOC` 是 5k10 这类纯 PCIe 机器上跑 EPv2 direct 的关键规避配置。
+`NCCL_LSA_TEAM_SIZE=1` 和 `NCCL_NET_MERGE_LEVEL=LOC` 是当前纯 PCIe 节点运行
+EPv2 direct 的必要配置。
 
 ---
 
-## 二、运行方式与测试数据
+## 3. 当前数据流
 
-### 2.1 支持范围
+EPv2 的通信模式在 server 初始化时固定为 `direct`，但 MoE runner layout 按推理阶段选择：
 
-当前 SM120 分支只验证 **DeepSeek-V4-Flash + DeepGEMM + EPv2 direct + FP8 dispatcher output**。
+| 推理阶段 | EPv2 dispatch layout | DeepGEMM 输入 | CPU sync |
+| --- | --- | --- | --- |
+| Prefill / extend | non-expanded contiguous | contiguous grouped GEMM | exact count readback |
+| Decode / non-extend | native expanded | `expand_to_masked_slab` 后进入 masked grouped GEMM | `do_cpu_sync=False` |
 
-| 场景 | 状态 | 说明 |
-| --- | --- | --- |
-| `--moe-a2a-backend epv2 --epv2-mode direct --epv2-dispatcher-output-dtype fp8 --moe-runner-backend deep_gemm` | 支持 | SM120 主线 |
-| `epv2 hybrid` | 未作为 5k10 主线验证 | 5k10 当前只做 direct 调优适配 |
-| Triton / BF16 runner | 未纳入本轮 SM120 性能矩阵 | 后续单独补 |
-| CUDA graph | 本轮性能矩阵关闭 | 结果不是 graph-on 上限 |
+Decode 路径为：
 
-### 2.2 EPv2 direct 启动命令
+```text
+BF16 hidden states
+  -> FP8 pre-quant + scales
+  -> EPv2 direct expanded dispatch
+  -> expand_to_masked_slab([E_local, max_m, hidden])
+  -> DeepGEMM masked gate/up GEMM
+  -> clamp + SiLU + FP8 quant
+  -> DeepGEMM masked down GEMM
+  -> masked_slab_to_expand
+  -> EPv2 native combine
+```
 
-本轮性能矩阵使用如下 server 参数：
+`masked_m` 保存每个本地 expert 的真实 token 数；`masked_max_m` 使用固定
+`capacity * ep_group_size`，避免 ragged DP 下其他 rank 的较大 batch 溢出本 rank buffer。
+
+### 3.1 与 MegaMoE 的边界
+
+EPv2 不需要 MegaMoE：
 
 ```bash
-source /root/menyu/epv2_env.sh
-cd /root/menyu/sglang_epv2
+export SGLANG_OPT_FIX_MEGA_MOE_MEMORY=false
+```
 
-export PYTHONPATH=/root/menyu/sglang_epv2/python:${PYTHONPATH:-}
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export SGLANG_OPT_FIX_MEGA_MOE_MEMORY=true
+该变量设为 `false` 是为了覆盖容器可能继承的旧环境。EPv2 adapter 不读取
+MegaMoE backend、不写 `disable_swizzle` 标记，也不调用 MegaMoE kernel。
+
+Clamp fusion 是独立的 DeepGEMM activation 优化：
+
+```bash
 export SGLANG_OPT_SWIGLU_CLAMP_FUSION=true
 export SGLANG_OPT_USE_JIT_EP_ACTIVATION=1
-export SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
-export SGLANG_EPV2_NUM_SMS=8
+```
+
+---
+
+## 4. EPv2 启动命令
+
+```bash
+cd /root/menyu/sglang_epv2_sm120_sync
+
+export PYTHONPATH=/root/menyu/sglang_epv2_sm120_sync/python:${PYTHONPATH:-}
+export LD_LIBRARY_PATH=/root/menyu/nccl/build/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+export NCCL_CUMEM_ENABLE=1
+export NCCL_WIN_ENABLE=1
+export NCCL_LSA_TEAM_SIZE=1
+export NCCL_NET_MERGE_LEVEL=LOC
+export NCCL_NVLS_ENABLE=0
+export NVSHMEM_BOOTSTRAP=UID
+export NVSHMEM_DISABLE_CUDA_VMM=0
+export NVSHMEM_QP_DEPTH=4096
+export NVSHMEM_IBGDA_NIC_HANDLER=cpu
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+export SGLANG_ENABLE_JIT_DEEPGEMM=1
+export SGLANG_DSV4_FP4_EXPERTS=1
+export SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
+export SGLANG_DEEPEP_V2_NUM_SMS=8
+export SGLANG_OPT_FIX_MEGA_MOE_MEMORY=false
+export SGLANG_OPT_SWIGLU_CLAMP_FUSION=true
+export SGLANG_OPT_USE_JIT_EP_ACTIVATION=1
 
 python3 -m sglang.launch_server \
   --model-path /root/menyu/models/DeepSeek-V4-Flash \
@@ -178,9 +205,9 @@ python3 -m sglang.launch_server \
   --dp-size 8 \
   --ep-size 8 \
   --enable-dp-attention \
-  --moe-a2a-backend epv2 \
-  --epv2-mode direct \
-  --epv2-dispatcher-output-dtype fp8 \
+  --moe-a2a-backend deepep_v2 \
+  --deepep-v2-mode direct \
+  --deepep-v2-dispatcher-output-dtype fp8 \
   --disable-overlap-schedule \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
@@ -196,64 +223,48 @@ python3 -m sglang.launch_server \
   --skip-server-warmup
 ```
 
-注意：本轮 SM120 性能矩阵为了和 TP / DP+TP / NCCL_EP 历史矩阵对齐，显式关闭 CUDA graph。不要把这组结果理解成 EPv2 direct 的 graph-on 性能上限。
+---
 
-### 2.3 TP / DP+TP baseline 环境
+## 5. 正确性验证
 
-TP / DP+TP baseline 不能直接套 EPv2 的 fused clamp env。DSV4 DeepGEMM TP path 在某些 varlen shape 下会触发：
-
-```text
-AssertionError: swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True
-```
-
-原因是 `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` 时会把 `swiglu_limit` 传入 `_varlen_deep_gemm_silu_mul_quant`；而 `N % 4 != 0 or G % 4 != 0` 会关闭 JIT activation，最终触发 assert。
-
-已验证 TP / DP+TP baseline 应使用：
+### 5.1 单元测试
 
 ```bash
-export SGLANG_OPT_FIX_MEGA_MOE_MEMORY=false
-export SGLANG_OPT_SWIGLU_CLAMP_FUSION=false
-export SGLANG_OPT_USE_JIT_EP_ACTIVATION=1
+python3 -m pytest -q \
+  test/registered/unit/server_args/test_server_args.py::TestDeepEPv2Args \
+  test/registered/unit/layers/moe/test_deepep_v2_masked_slab.py
 ```
 
-启动参数与 EPv2 相同，只是不加 `--moe-a2a-backend epv2`：
-
-```bash
-# TP8
---tp-size 8
-
-# DP+TP
---tp-size 8 --dp-size 8 --enable-dp-attention
-```
-
-验证日志：
+结果：
 
 ```text
-/root/menyu/logs/tp_start_debug_20260630_032157/summary.tsv
+20 passed
 ```
 
-| FIX_MEGA | SWIGLU_CLAMP | 结果 |
+### 5.2 E2E 输出
+
+使用 `/v1/chat/completions`、`temperature=0`、`max_tokens=256`：
+
+| 问题 | 当前 EPv2 输出 | 结果 |
 | --- | --- | --- |
-| true | true | ERROR |
-| false | true | ERROR |
-| false | false | READY |
+| 中国和日本首都 | `中国和日本的首都分别是北京市和东京都。` | PASS |
+| `17*23+19` | `17 × 23 = 391，391 + 19 = 410，所以答案是 410。` | PASS |
+| 英译中 | `敏捷的棕色狐狸跳过了懒狗。` | PASS |
 
-最小 serving smoke：
+验证配置：`direct + FP8 + DeepGEMM + FIX_MEGA=false + CLAMP_FUSION=true`。
+当前输出无乱码。
 
-```text
-/root/menyu/logs/tp_bench_debug_20260630_032756/bench_tp8_1024_1.log
-/root/menyu/logs/dp8_tp_bench_debug_20260630_033018/bench_dp8_tp_1024_1.log
-```
+---
 
-### 2.4 Benchmark 命令
+## 6. 性能测试方法
 
-性能矩阵使用 `sglang.benchmark.serving`：
+### 6.1 Benchmark 命令
 
 ```bash
 python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
-  --port ${PORT} \
+  --port 32124 \
   --model /root/menyu/models/DeepSeek-V4-Flash \
   --tokenizer /root/menyu/models/DeepSeek-V4-Flash \
   --dataset-name random-ids \
@@ -264,98 +275,142 @@ python3 -m sglang.benchmark.serving \
   --max-concurrency 1 \
   --tokenize-prompt \
   --disable-tqdm \
-  --output-file ${DETAIL_JSONL}
+  --output-details \
+  --output-file ${DETAIL_JSON}
 ```
 
-矩阵：
-
-```bash
-CONFIGS="tp8 dp8_tp dp8_ep_epv2_direct"
-SHAPES="8192:1024 1024:1024 1024:8192 1024:1 8192:1 1:1024"
-NUM_PROMPTS=3
-CONCURRENCY=1
-```
-
-结果路径：
+完整矩阵：
 
 ```text
-# TP / DP+TP baseline
-/root/menyu/logs/epv2_corrected_perf_20260630_033641
-
-# EPv2 direct 完整 PASS 矩阵
-/root/menyu/logs/epv2_vs_ncclep_matrix_20260630_005158
-
-# 合并报告
-/root/menyu/logs/epv2_corrected_perf_20260630_033641/corrected_tp_dp_tp_plus_epv2_report.md
-/root/menyu/logs/epv2_corrected_perf_20260630_033641/ttft_tpot_detailed_report.md
+configs: TP8, DP8+TP, DP8+EPv2-direct
+shapes:  8192/1024, 1024/1024, 1024/8192, 1024/1, 8192/1, 1/1024
+prompts: 3
+CC:      1
+graph:   OFF
 ```
 
-说明：`epv2_corrected_perf_20260630_033641` 中有一条 EPv2 `BENCH_FAIL` 是手动中断重复 EPv2 重跑造成的，不代表 EPv2 failure。合并报告使用的是 `epv2_vs_ncclep_matrix_20260630_005158` 中完整 PASS 的 EPv2 direct 数据。
+### 6.2 为什么分成两套性能结果
 
-### 2.5 Correctness
+DSV4 Flash 的 TP8 当前不能使用 fused clamp。JIT activation guard 包含：
 
-DSV4 Flash FP8 本地 tokenizer 缺 `chat_template`，raw `/generate` plain prompt 可能出现模板碎片，不作为 strict correctness。Strict correctness 使用 `/v1/chat/completions`：
-
-1. 事实问答：中国和日本首都，期望包含北京/东京。
-2. 算术：`17*23+19`，期望 `410`。
-3. 翻译：`The quick brown fox jumps over the lazy dog`，期望合理中文翻译。
-
-已验证日志：
-
-```text
-/root/menyu/logs/epv2_direct_deepgemm_psum_clean_correctness_20260629_111625.log
-/root/menyu/logs/epv2_direct_deepgemm_psum_clean_outputs_*.txt
+```python
+if N % 4 != 0 or G % 4 != 0 or D // 8 < E:
+    use_jit_ep_activation = False
 ```
 
-结论：EPv2 direct + DeepGEMM psum layout correctness PASS。
+DSV4 Flash 有 256 个 expert、MoE intermediate size 2048：
 
-### 2.6 性能总吞吐
+| 配置 | 本地 experts `E` | 本地 intermediate `D` | `D/8 >= E` |
+| --- | ---: | ---: | --- |
+| TP8 | 256 | 256 | 不满足 |
+| EP8 | 32 | 2048 | 满足 |
 
-| ISL | OSL | TP8 total tok/s | DP+TP total tok/s | EPv2 direct total tok/s | EPv2 vs TP8 | EPv2 vs DP+TP |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8192 | 1024 | 82.24 | 79.59 | 90.53 | +10.1% | +13.7% |
-| 1024 | 1024 | 22.68 | 21.82 | 25.45 | +12.2% | +16.6% |
-| 1024 | 8192 | 13.30 | 12.93 | 15.41 | +15.9% | +19.2% |
-| 1024 | 1 | 343.18 | 346.23 | 342.00 | -0.3% | -1.2% |
-| 8192 | 1 | 329.00 | 351.65 | 354.31 | +7.7% | +0.8% |
-| 1 | 1024 | 11.74 | 11.55 | 13.86 | +18.1% | +20.0% |
+因此不存在“TP8 和 EP8 同时开启 fused clamp”的当前可运行矩阵。本文分别记录：
 
-### 2.7 TTFT / TPOT mean + P95
+1. **公平 ablation**：三边全部关闭 clamp fusion。
+2. **当前可部署配置**：EPv2 开启 clamp fusion，TP8 使用非融合 fallback。
 
-| ISL | OSL | Config | TTFT mean / P95 ms | TPOT mean / P95 ms | Total tok/s |
-| ---: | ---: | --- | ---: | ---: | ---: |
-| 8192 | 1024 | TP8 | 24943.42 / 24997.14 | 85.15 / 85.24 | 82.24 |
-| 8192 | 1024 | DP+TP | 26232.17 / 26392.62 | 87.54 / 88.08 | 79.59 |
-| 8192 | 1024 | EPv2 direct | 26738.34 / 27212.68 | 73.37 / 74.93 | 90.53 |
-| 1024 | 1024 | TP8 | 2986.41 / 2987.14 | 85.35 / 85.56 | 22.68 |
-| 1024 | 1024 | DP+TP | 4976.53 / 5817.30 | 86.87 / 87.33 | 21.82 |
-| 1024 | 1024 | EPv2 direct | 5635.19 / 6503.12 | 73.16 / 73.25 | 25.45 |
-| 1024 | 8192 | TP8 | 2985.89 / 2986.18 | 84.24 / 84.37 | 13.30 |
-| 1024 | 8192 | DP+TP | 2830.52 / 2855.13 | 86.69 / 87.02 | 12.93 |
-| 1024 | 8192 | EPv2 direct | 2805.05 / 2838.23 | 72.69 / 73.30 | 15.41 |
-| 1024 | 1 | TP8 | 2984.95 / 2986.10 | 0.00 / 0.00 | 343.18 |
-| 1024 | 1 | DP+TP | 2957.33 / 3104.66 | 0.00 / 0.00 | 346.23 |
-| 1024 | 1 | EPv2 direct | 2994.16 / 3154.77 | 0.00 / 0.00 | 342.00 |
-| 8192 | 1 | TP8 | 24901.19 / 24911.24 | 0.00 / 0.00 | 329.00 |
-| 8192 | 1 | DP+TP | 23295.50 / 23472.86 | 0.00 / 0.00 | 351.65 |
-| 8192 | 1 | EPv2 direct | 23120.48 / 23389.92 | 0.00 / 0.00 | 354.31 |
-| 1 | 1024 | TP8 | 89.80 / 90.36 | 85.23 / 85.49 | 11.74 |
-| 1 | 1024 | DP+TP | 92.64 / 93.83 | 86.62 / 87.11 | 11.55 |
-| 1 | 1024 | EPv2 direct | 90.04 / 91.33 | 72.21 / 72.42 | 13.86 |
-
-### 2.8 结果解读
-
-- Decode-heavy `1/1024`：EPv2 direct 的 TPOT 为 `72.21 / 72.42 ms`，明显低于 TP8 `85.23 / 85.49 ms` 和 DP+TP `86.62 / 87.11 ms`。
-- Long-output `1024/8192`：EPv2 direct 的 TTFT 和 TPOT 均优于 TP8 / DP+TP。
-- Prefill-only `1024/1`：三者接近，EPv2 direct 没明显优势。
-- Long prefill `8192/1`：EPv2 direct 与 DP+TP 接近，略高于 TP8。
-- 本轮数据 CUDA graph 关闭；graph-on 需要另测，不能直接用这里的数据代表生产 decode 上限。
+两套结果回答的问题不同，不能混成一张“EP 一定比 TP 快”的表。
 
 ---
 
-## 三、代码修改与优化总结
+## 7. 公平矩阵：三边 clamp fusion 全部关闭
 
-### 3.1 SM120 DeepGEMM enable
+共同环境：
+
+```bash
+export SGLANG_OPT_FIX_MEGA_MOE_MEMORY=false
+export SGLANG_OPT_SWIGLU_CLAMP_FUSION=false
+export SGLANG_OPT_USE_JIT_EP_ACTIVATION=1
+```
+
+18/18 benchmark case PASS，三组 server correctness gate PASS。
+
+| ISL/OSL | 配置 | Total tok/s | TTFT mean/P95 ms | TPOT mean/P95 ms |
+| --- | --- | ---: | ---: | ---: |
+| 8192/1024 | TP8 | 88.11 | 22197.86 / 22200.47 | 80.54 / 81.03 |
+| 8192/1024 | DP8+TP | 82.13 | 26720.66 / 27028.66 | 83.56 / 84.18 |
+| 8192/1024 | DP8+EPv2 | 60.76 | 25614.39 / 25718.17 | 123.22 / 123.28 |
+| 1024/1024 | TP8 | 23.93 | 2701.27 / 2701.54 | 81.03 / 81.10 |
+| 1024/1024 | DP8+TP | 23.27 | 2833.56 / 2879.17 | 83.27 / 83.61 |
+| 1024/1024 | DP8+EPv2 | 15.79 | 4582.75 / 4683.41 | 122.30 / 122.37 |
+| 1024/8192 | TP8 | 13.82 | 2702.03 / 2702.40 | 81.11 / 81.21 |
+| 1024/8192 | DP8+TP | 13.59 | 2835.66 / 2890.73 | 82.46 / 82.86 |
+| 1024/8192 | DP8+EPv2 | 9.15 | 2724.10 / 2735.84 | 122.62 / 122.69 |
+| 1024/1 | TP8 | 379.19 | 2701.25 / 2701.81 | N/A |
+| 1024/1 | DP8+TP | 365.14 | 1870.27 / 2806.40 | N/A |
+| 1024/1 | DP8+EPv2 | 344.68 | 2970.34 / 2996.48 | N/A |
+| 8192/1 | TP8 | 368.72 | 22218.03 / 22224.83 | N/A |
+| 8192/1 | DP8+TP | 356.52 | 15296.37 / 23040.39 | N/A |
+| 8192/1 | DP8+EPv2 | 367.50 | 22290.38 / 22368.63 | N/A |
+| 1/1024 | TP8 | 12.29 | 84.42 / 84.76 | 81.42 / 81.49 |
+| 1/1024 | DP8+TP | 12.03 | 90.81 / 92.07 | 83.21 / 84.04 |
+| 1/1024 | DP8+EPv2 | 8.19 | 87.00 / 89.11 | 122.23 / 122.37 |
+
+日志：
+
+```text
+/root/menyu/logs/epv2_sm120_fair_clamp_off_20260720_235800
+```
+
+结论：关闭 fused clamp 后，EPv2 output-heavy case 的 TPOT 上升到约 122 ms。
+这是 DeepGEMM activation 前后处理退化，不是 EPv2 direct 通信正确性问题。
+
+---
+
+## 8. 当前可部署配置：EPv2 clamp fusion 开启
+
+cleanup 后配置：
+
+```bash
+export SGLANG_OPT_FIX_MEGA_MOE_MEMORY=false
+export SGLANG_OPT_SWIGLU_CLAMP_FUSION=true
+export SGLANG_OPT_USE_JIT_EP_ACTIVATION=1
+```
+
+代表性复测：
+
+| ISL/OSL | 配置 | Total tok/s | TTFT mean/P95 ms | TPOT mean/P95 ms |
+| --- | --- | ---: | ---: | ---: |
+| 1024/1 | DP8+EPv2 | 338.56 | 3024.05 / 3088.80 | N/A |
+| 1/1024 | DP8+EPv2 | 12.78 | 359.63 / 360.23 | 78.04 / 78.35 |
+
+日志：
+
+```text
+/root/menyu/logs/epv2_no_mega_cleanup_20260721
+```
+
+与 cleanup 前、同一 5k11 上的 EPv2 optimized 结果对比：
+
+| ISL/OSL | cleanup 前 | cleanup 后 | 变化 |
+| --- | ---: | ---: | ---: |
+| 1024/1 total tok/s | 344.80 | 338.56 | -1.8% |
+| 1/1024 total tok/s | 12.98 | 12.78 | -1.5% |
+| 1/1024 TPOT mean | 77.12 ms | 78.04 ms | +1.2% |
+
+该差异处于短样本运行波动范围，说明移除 EPv2/MegaMoE 耦合没有造成显著性能回退。
+
+使用公平矩阵中的当前 TP8 baseline 作参考：
+
+| ISL/OSL | TP8 | EPv2 optimized | EPv2 相对 TP8 |
+| --- | ---: | ---: | ---: |
+| 1024/1 total tok/s | 379.19 | 338.56 | -10.7% |
+| 1/1024 total tok/s | 12.29 | 12.78 | +4.0% |
+| 1/1024 TPOT mean | 81.42 ms | 78.04 ms | -4.2% |
+
+当前只能得出：
+
+- Decode representative case：EPv2 optimized 略优于 TP8。
+- Prefill representative case：EPv2 慢于 TP8。
+- 旧 README 中“EPv2 全矩阵优于 TP”的结论不再保留。
+- 完整 optimized EPv2 矩阵仍需按当前 commit 重新测试。
+
+---
+
+## 9. SM120 分支代码修改
+
+### 9.1 DeepGEMM SM120 enable
 
 涉及文件：
 
@@ -364,50 +419,23 @@ python/sglang/srt/layers/deep_gemm_wrapper/configurer.py
 python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
 ```
 
-修改点：
+- 允许 SM120 启用外部 DeepGEMM PR #324。
+- `DEEPGEMM_BLACKWELL` 扩展到 SM100/SM120。
+- SM120 使用 packed UE8M0 scale。
+- 兼容新旧 `get_mn_major_tma_aligned_tensor` import API。
 
-- 取消原先对 `sm_version == 120` 的 DeepGEMM 禁用。
-- `DEEPGEMM_BLACKWELL` 扩展到 `sm100 or sm120`。
-- `DEEPGEMM_SCALE_UE8M0` 在 SM120 下开启，匹配 DeepGEMM PR #324 的 packed UE8M0 scale path。
-- `get_mn_major_tma_aligned_tensor` 增加新旧 DeepGEMM API 兼容 fallback。
-- `grouped_gemm_nt_f8f8bf16_contig` 增加 `use_psum_layout` / `expected_m_for_psum_layout` 参数，适配 DeepGEMM PR #324 的 psum contiguous path。
-
-### 3.2 EPv2 direct 到 DeepGEMM psum layout
+### 9.2 UE8M0 scale packing
 
 涉及文件：
 
 ```text
-python/sglang/srt/layers/moe/token_dispatcher/epv2.py
-python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
-python/sglang/srt/layers/moe/utils.py
-```
-
-修改点：
-
-- EPv2 direct expanded output 不再先 repack 成 masked slab，而是直接走 DeepGEMM psum contiguous layout。
-- `DeepGemmRunnerInput` 增加 `use_psum_layout`。
-- `pre_permute_epv2_to_deep_gemm` 在 expanded/direct 路径中将 `psum_num_recv_tokens_per_expert` 作为 grouped layout 信息传入 DeepGEMM。
-- 对 non-expanded path，`num_recv_tokens_per_expert` 可保持 GPU tensor，减少 Python list / host sync。
-- `expected_m` 继续作为 DeepGEMM 调度 hint，而不是模型语义 token limit。
-
-### 3.3 Top-k duplicate 与 padding 处理
-
-涉及文件：
-
-```text
-python/sglang/srt/layers/moe/token_dispatcher/epv2.py
-python/sglang/srt/layers/moe/ep_moe/kernels.py
 python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
 ```
 
-修改点：
+- 显式按 4 个 uint8 exponent 打包到一个 int32。
+- 避免对非 contiguous uint8 tensor 直接 `.view(torch.int32)`。
 
-- `_deduplicate_topk_for_epv2`：同一 token 的重复 expert id 会把权重累加到第一条 lane，后续 duplicate lane 标记为 `-1/0`，避免 EPv2 dispatch epilogue 对重复 local expert id 的限制。
-- `m_indices` padding 初始化为 `-1`，避免 DeepGEMM 读取未初始化 padding expert id。
-- scatter / expand m_indices init kernel 中 padding row 写 `-1`。
-- `ep_gather` 增加 `APPLY_WEIGHTS` 开关，expanded combine 语义下可避免重复乘权重。
-
-### 3.4 FP4 / MXFP4 quant config 传递
+### 9.3 FP4/MXFP4 capability
 
 涉及文件：
 
@@ -416,37 +444,31 @@ python/sglang/srt/layers/quantization/fp8.py
 python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
 ```
 
-修改点：
+- dispatcher quant config 传递 `is_fp4_experts`。
+- Quark MXFP4 显式传递 FP4 semantic dtype。
 
-- dispatcher quant config 中增加 `is_fp4_experts`。
-- Quark MXFP4 MoE 显式传 `torch.float4_e2m1fn_x2` 与 `is_fp4_experts=True`。
-- EPv2/DeepGEMM path 可以按 FP8/FP4 expert weight 语义选择 recipe 和 scale layout。
+### 9.4 Clamp fusion 与 MegaMoE 解耦
 
-### 3.5 Debug 开关
+涉及文件：
 
-默认不启用，仅用于定位 correctness / layout 问题：
-
-```bash
-export SGLANG_EPV2_DEBUG_TENSOR=1
-export SGLANG_EPV2_DEBUG_TOPK=1
+```text
+python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
 ```
 
-功能：
+- `SGLANG_OPT_SWIGLU_CLAMP_FUSION` 独立控制 fused activation。
+- 不在 `DeepGemmRunnerCore` 新增 `get_moe_a2a_backend()` 依赖。
+- 不在 EPv2 adapter 写 MegaMoE/swizzle 特判。
+- upstream 原有 MegaMoE 开关和 kernel 不做修改。
 
-- 打印 dispatch input / recv hidden / recv scale / combine input-output 的 shape、dtype、NaN/Inf、absmax。
-- 打印 top-k duplicate、local duplicate、weight sum 分布和样例。
+---
 
-### 3.6 当前限制
+## 10. 当前限制与后续工作
 
-- 当前 SM120 验证只覆盖 DeepGEMM FP8 direct path；hybrid / Triton / BF16 需要另测。
-- 当前性能矩阵关闭 CUDA graph；graph-on 的 decode 上限需另开专门矩阵。
-- TP / DP+TP baseline 必须使用 `FIX_MEGA=false + SWIGLU_CLAMP=false`，否则会触发 DSV4 DeepGEMM fused clamp varlen assert。
-- EPv2 `direct` / `hybrid` 仍是 server 生命周期固定模式，不是 DeepEP v1 `auto` 式 prefill/decode 动态切换。
-- 5k10 纯 PCIe 场景依赖 `NCCL_LSA_TEAM_SIZE=1` 和 `NCCL_NET_MERGE_LEVEL=LOC`。
-
-### 3.7 后续建议
-
-1. 补充 CUDA graph enabled 的 EPv2 direct decode 矩阵，并与本轮 graph-off 矩阵分开记录。
-2. 单独验证 hybrid/prefill path，不和 5k10 direct 主线混在同一结论里。
-3. 给 TP / DP+TP baseline 脚本增加 env guard，避免再次把 EPv2 fused clamp env 套到 TP baseline。
-4. 将 DeepGEMM PR #324 dependency 写入安装脚本或 requirements 文档，避免 fallback 到 vendored/旧 deep_gemm。
+1. 重新跑当前 commit 的完整 EPv2 clamp-on 矩阵，不能继续引用旧 psum-contiguous 数据。
+2. 单独补 CUDA graph enabled 的 decode 矩阵；本文结果不是 graph-on 上限。
+3. 若需要 TP8/EP8 完全相同的 fused clamp 条件，需要扩展 JIT activation 对
+   `D/8 < E` shape 的支持，或实现支持 `swiglu_limit` 的 fused fallback。
+4. 对通信库本身做公平比较时，应使用 EP library UT 或固定相同 MoE compute path；
+   e2e best-config 对比会混入 activation、layout 和 scheduler 差异。
+5. 当前只验证 direct + DeepGEMM + FP8。Hybrid、Triton/BF16 和其他模型需要单独验证。
+6. 将 NCCL、DeepEP v2 和 DeepGEMM PR #324 固化到可复现安装脚本。

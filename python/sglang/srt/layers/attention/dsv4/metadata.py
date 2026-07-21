@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 
 if TYPE_CHECKING:
     pass
@@ -125,6 +125,7 @@ class PagedIndexerMetadata:
         use_fp4_indexer = get_global_server_args().enable_deepseek_v4_fp4_indexer
         if (
             (envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer)
+            or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
         ):
             self.deep_gemm_metadata = None

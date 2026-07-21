@@ -122,8 +122,6 @@ def grouped_gemm_nt_f8f8bf16_contig(
     m_indices: torch.Tensor,
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
-    use_psum_layout: bool = False,
-    expected_m_for_psum_layout: Optional[int] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -143,13 +141,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            lhs,
-            rhs,
-            out,
-            m_indices,
-            use_psum_layout=use_psum_layout,
-            expected_m_for_psum_layout=expected_m_for_psum_layout,
-            **fp4_kwargs,
+            lhs, rhs, out, m_indices, **fp4_kwargs
         )
 
 
@@ -266,6 +258,8 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
     x, x_scale = x_fp8
 
     if x_scale.dtype == torch.int:
+        return
+    if not DEEPGEMM_SCALE_UE8M0:
         return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0

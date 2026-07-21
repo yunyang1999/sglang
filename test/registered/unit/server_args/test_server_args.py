@@ -59,6 +59,80 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMultimodalFeatureTransport(CustomTestCase):
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="cuda_ipc",
+            tokenizer_worker_num=4,
+            base_gpu_id=2,
+        )
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("base GPU 2", output)
+        self.assertIn("4 tokenizer worker", output)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_legacy_keep_flag_maps_to_cuda_ipc(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertFalse(server_args.keep_mm_feature_on_device)
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("deprecated", logs.output[0])
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_explicit_cpu_overrides_legacy_environment(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("overrides", logs.output[0])
+
+    def test_default_transport_is_cpu(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_ipc_rejects_multi_node(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "single node"):
+            server_args._handle_multimodal_feature_transport()
+
+
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):
         server_args = ServerArgs(
@@ -156,6 +230,22 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
+
+
+class TestSkipTokenizerInit(unittest.TestCase):
+    def test_skip_tokenizer_worker_counts(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            skip_tokenizer_init=True,
+            tokenizer_worker_num=4,
+            detokenizer_worker_num=3,
+        )
+
+        server_args._handle_tokenizer_batching()
+
+        # Tokenizer fanout preserved; detokenizer coerced to 1 (no decode work).
+        self.assertEqual(server_args.tokenizer_worker_num, 4)
+        self.assertEqual(server_args.detokenizer_worker_num, 1)
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
@@ -1367,6 +1457,93 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+
+class TestDeepEPv2Args(CustomTestCase):
+    """DeepEP v2 server-args resolution + validation. The dummy-model path
+    short-circuits __post_init__, so _handle_a2a_moe() is invoked directly."""
+
+    def _args(self, **overrides):
+        server_args = ServerArgs(model_path="dummy", moe_a2a_backend="deepep_v2")
+        # The deepep_v2 branch mutates cuda_graph_config.{decode,prefill}.backend,
+        # so it must exist (the dummy path leaves it unset otherwise).
+        server_args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=512),
+            prefill=PhaseConfig(backend=Backend.FULL, max_bs=512),
+        )
+        for key, value in overrides.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_auto_runner_resolves_to_deep_gemm_for_fp8(self):
+        args = self._args(
+            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="fp8"
+        )
+        args._handle_a2a_moe()
+        self.assertEqual(args.moe_runner_backend, "deep_gemm")
+
+    def test_auto_runner_resolves_to_triton_for_bf16(self):
+        args = self._args(
+            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="bf16"
+        )
+        args._handle_a2a_moe()
+        self.assertEqual(args.moe_runner_backend, "triton")
+
+    def test_auto_runner_defaults_to_deep_gemm(self):
+        args = self._args(
+            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="auto"
+        )
+        args._handle_a2a_moe()
+        self.assertEqual(args.moe_runner_backend, "deep_gemm")
+
+    def test_unsupported_runner_rejected(self):
+        args = self._args(moe_runner_backend="flashinfer_trtllm")
+        with self.assertRaises(ValueError):
+            args._handle_a2a_moe()
+
+    def test_two_batch_overlap_rejected(self):
+        args = self._args(moe_runner_backend="deep_gemm", enable_two_batch_overlap=True)
+        with self.assertRaises(ValueError):
+            args._handle_a2a_moe()
+
+    # --- prefill capacity pre-check (per-rank chunk vs dispatch buffer cap) ---
+    _CAP_ENV = "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
+
+    def test_prefill_chunk_exceeding_cap_rejected(self):
+        args = self._args(moe_runner_backend="deep_gemm", chunked_prefill_size=2048)
+        with patch.dict(os.environ, {self._CAP_ENV: "1024"}):
+            with self.assertRaisesRegex(ValueError, "NUM_MAX_DISPATCH_TOKENS_PER_RANK"):
+                args._handle_a2a_moe()
+
+    def test_prefill_chunk_at_cap_boundary_accepted(self):
+        # chunk == cap is the documented (and currently benchmarked) edge; the
+        # guard must be strict-greater-than.
+        args = self._args(moe_runner_backend="deep_gemm", chunked_prefill_size=1024)
+        with patch.dict(os.environ, {self._CAP_ENV: "1024"}):
+            args._handle_a2a_moe()
+        self.assertEqual(args.moe_runner_backend, "deep_gemm")
+
+    def test_prefill_chunk_rejected_under_default_cap(self):
+        # Default cap is 128: a typical 1024-token per-rank chunk must be
+        # rejected at boot instead of at the first full prefill chunk.
+        args = self._args(moe_runner_backend="deep_gemm", chunked_prefill_size=1024)
+        with self.assertRaisesRegex(ValueError, "chunked prefill budget"):
+            args._handle_a2a_moe()
+
+    def test_prefill_chunk_check_skipped_for_decode_disaggregation(self):
+        args = self._args(
+            moe_runner_backend="deep_gemm",
+            chunked_prefill_size=4096,
+            disaggregation_mode="decode",
+        )
+        args._handle_a2a_moe()
+
+    def test_prefill_chunk_check_skipped_when_chunking_disabled(self):
+        for disabled in (None, 0, -1):
+            args = self._args(
+                moe_runner_backend="deep_gemm", chunked_prefill_size=disabled
+            )
+            args._handle_a2a_moe()
 
 
 class TestHandleCrashDumpEnv(CustomTestCase):

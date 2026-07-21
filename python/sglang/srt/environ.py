@@ -235,6 +235,7 @@ class Envs:
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
+    # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
 
     # SGLang CI
@@ -245,6 +246,8 @@ class Envs:
     # else /tmp); see debug_utils/cuda_coredump.py.
     SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
+    # Expand jit_kernel test grids to their full parameter ranges (nightly).
+    SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
 
     # Constrained Decoding (Grammar)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
@@ -575,6 +578,8 @@ class Envs:
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    # Enable int4x2 weights loading
+    SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
@@ -661,18 +666,12 @@ class Envs:
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
-    # DeepEP legacy MNNVL/fabric memory handle support. Set false on
-    # environments where CU_MEM_HANDLE_TYPE_FABRIC is advertised but unusable.
-    SGLANG_DEEPEP_ALLOW_MNNVL = EnvBool(True)
     # DeepEP v2 per-rank communication buffer capacity. This is not a model
     # semantic token limit; large prefill/chunked-prefill workloads may need a
     # larger value.
-    SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets DeepEP v2 ElasticBuffer choose the communication SM count.
-    SGLANG_EPV2_NUM_SMS = EnvInt(0)
-    # Compatibility fallback for synthetic tests that instantiate the EPv2
-    # dispatcher without ServerArgs. Prefer --epv2-mode in server runs.
-    SGLANG_EPV2_ALLOW_HYBRID_MODE = EnvBool(False)
+    SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default

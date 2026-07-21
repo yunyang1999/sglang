@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -6,8 +7,13 @@ import einops
 import torch
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -36,9 +42,9 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
-    from sglang.srt.layers.moe.token_dispatcher.epv2 import (
-        EpV2CombineInput,
-        EpV2DispatchOutput,
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+        DeepEPv2CombineInput,
+        DeepEPv2DispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -51,7 +57,7 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-# Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
+# Imported for the non-fused activation fallback path.
 if not (_is_npu or _is_hip) and _is_cuda:
     from sglang.jit_kernel.activation import silu_and_mul as _legacy_silu_and_mul
 elif _is_musa:
@@ -68,7 +74,7 @@ _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
 def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
-    temp = x.to(torch.float32).view(torch.int32)
+    temp = x.to(torch.float32).contiguous().view(torch.int32)
     exp = torch.bitwise_right_shift(temp, 23)
     mant = torch.bitwise_and(temp, 0x7FFFFF)
     is_ru = torch.logical_and(
@@ -76,8 +82,14 @@ def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
         ~torch.logical_and((exp == 0), (mant <= 0x400000)),
     )
     exp = torch.where(is_ru, exp + 1, exp)
-    new_x = exp.to(torch.uint8).view(torch.int)
-    return new_x.transpose(1, 2).contiguous().transpose(1, 2)
+    exp_u32 = exp.to(torch.int32)
+    packed = (
+        exp_u32[..., 0::4]
+        | torch.bitwise_left_shift(exp_u32[..., 1::4], 8)
+        | torch.bitwise_left_shift(exp_u32[..., 2::4], 16)
+        | torch.bitwise_left_shift(exp_u32[..., 3::4], 24)
+    )
+    return packed.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
@@ -98,7 +110,6 @@ class DeepGemmRunnerInput(RunnerInput):
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
     hidden_states_scale_tma_aligned: bool = False
-    use_psum_layout: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -143,10 +154,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation == "silu"
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
+        self.use_fused_activation = (
+            envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
+            and envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+        )
         self.use_swizzle = False
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-            assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
-            assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+            assert self.use_fused_activation
             self.use_swizzle = True
 
     def run(
@@ -236,19 +250,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
-            use_psum_layout=runner_input.use_psum_layout,
-            expected_m_for_psum_layout=runner_input.expected_m
-            if runner_input.use_psum_layout
-            else None,
         )
+
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if self.swiglu_limit is not None and self.use_fused_activation:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
-            use_contig_swizzle = self.use_swizzle and not running_state.get(
-                "epv2_disable_contig_swizzle", False
-            )
 
             down_input_fp8 = torch.empty(
                 (all_tokens, N // 2),
@@ -271,13 +279,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 swiglu_limit=swiglu_limit_arg,
-                swizzle=use_contig_swizzle,
+                swizzle=self.use_swizzle,
             )
             del gateup_output
         else:
-            # Hacky byte-equal fallback that reproduces the optimize-branch
-            # code path exactly: bf16 silu_and_mul then a separate per-token
-            # group fp8 quant. Kept behind the mega-moe-memory flag.
+            # Non-fused path: BF16 silu_and_mul followed by per-token FP8 quant.
             from sglang.kernels.ops.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
             )
@@ -307,11 +313,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             del down_input
 
-        down_output = torch.empty(
-            (all_tokens, K),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
+        # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
+        # allocation is required, so the downstream all-reduce takes the low-latency
+        # symmetric path. Only this final output enters the pool; intermediate
+        # buffers stay on the default allocator to bound pool occupancy.
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            down_output = torch.empty(
+                (all_tokens, K),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
@@ -322,11 +335,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
-            use_psum_layout=runner_input.use_psum_layout,
-            expected_m_for_psum_layout=runner_input.expected_m
-            if runner_input.use_psum_layout
-            else None,
         )
+
         return down_output
 
     def _run_bf16_contiguous_gemm(
@@ -380,11 +390,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         del gateup_output
 
         # GroupGemm-2: (M, N/2) (E, K, N/2) -> (M, K)
-        down_output = torch.empty(
-            (all_tokens, K),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            down_output = torch.empty(
+                (all_tokens, K),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
         deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
             down_input,
             w2_weight,
@@ -569,9 +582,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale
             )
 
-        down_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            down_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
 
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
         if down_gemm_overlap_args is None:
@@ -656,9 +672,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        down_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            down_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
         deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
             down_input,
             w2_weight,
@@ -753,9 +772,10 @@ def post_permute_deep_gemm_to_standard(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
 
-    output = torch.empty(
-        hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-    )
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        output = torch.empty(
+            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
+        )
     post_reorder_deepgemm(
         runner_output.hidden_states,
         output,
@@ -1120,9 +1140,9 @@ def _apply_swiglu_limit(
     return gateup_output
 
 
-@register_pre_permute("epv2", "deep_gemm")
-def pre_permute_epv2_to_deep_gemm(
-    dispatch_output: EpV2DispatchOutput,
+@register_pre_permute("deepep_v2", "deep_gemm")
+def pre_permute_deepep_v2_to_deep_gemm(
+    dispatch_output: DeepEPv2DispatchOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
@@ -1133,37 +1153,31 @@ def pre_permute_epv2_to_deep_gemm(
         ep_scatter_from_psum,
     )
 
-    (
-        hidden_states,
-        hidden_states_scale,
-        topk_ids,
-        topk_weights,
-        num_recv_tokens_per_expert,
-        psum_num_recv_tokens_per_expert,
-        is_expanded,
-        hidden_states_scale_tma_aligned,
-        epv2_use_masked,
-        epv2_expected_m,
-        epv2_masked_max_m,
-        epv2_total_expanded,
-        epv2_expert_alignment,
-    ) = dispatch_output
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+    num_recv_tokens_per_expert = dispatch_output.num_recv_tokens_per_expert
+    psum_num_recv_tokens_per_expert = dispatch_output.psum_num_recv_tokens_per_expert
+    is_expanded = dispatch_output.is_expanded
+    hidden_states_scale_tma_aligned = dispatch_output.hidden_states_scale_tma_aligned
+    deepep_v2_use_masked = dispatch_output.use_masked_gemm
+    deepep_v2_expected_m = dispatch_output.expected_m
+    deepep_v2_masked_max_m = dispatch_output.masked_max_m
+    deepep_v2_total_expanded = dispatch_output.total_expanded
+    deepep_v2_expert_alignment = dispatch_output.expert_alignment
     if hidden_states_scale is None:
         raise RuntimeError(
             "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
-            "Use --epv2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
+            "Use --deepep-v2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
         )
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        # The MegaMoE memory optimization enables a swizzled activation kernel
-        # for its gran=8 interleaved gate/up layout. EPv2's contiguous adapter
-        # is validated with the non-swizzled activation layout; using the
-        # swizzled reader here mixes gate/up pairs and breaks generation.
-        running_state["epv2_disable_contig_swizzle"] = True
     assert runner_config.activation == "silu"
 
     if is_expanded:
         if psum_num_recv_tokens_per_expert is None:
-            raise RuntimeError("EPv2 expanded layout requires native expert prefix sums.")
+            raise RuntimeError(
+                "DeepEP v2 expanded layout requires native expert prefix sums."
+            )
         all_tokens = hidden_states.shape[0]
         running_state["all_tokens"] = all_tokens
         running_state["hidden_states_shape"] = hidden_states.shape
@@ -1171,23 +1185,34 @@ def pre_permute_epv2_to_deep_gemm(
         running_state["hidden_states_dtype"] = hidden_states.dtype
         running_state["topk_ids"] = None
         running_state["topk_weights"] = topk_weights
-        running_state["epv2_expanded"] = True
+        running_state["deepep_v2_expanded"] = True
 
-        if epv2_use_masked:
-            # EPv2 expanded output is already a prefix-sum expert layout. Use
-            # DeepGEMM's native psum contiguous path directly instead of repacking
-            # to a masked slab and then repacking back to expanded order.
-            running_state["epv2_masked"] = False
-            running_state["epv2_psum"] = psum_num_recv_tokens_per_expert
-            running_state["epv2_total_expanded"] = epv2_total_expanded
-            running_state["epv2_expert_alignment"] = epv2_expert_alignment
+        if deepep_v2_use_masked:
+            # Masked-GEMM bridge: repack the expanded expert-packed buffer into a
+            # regular [E_local, max_m, hidden] slab so DeepGEMM's masked grouped
+            # GEMM bounds compute by per-expert real counts (masked_m), decoupled
+            # from the dispatch capacity. Static shapes -> cuda-graph safe.
+            from sglang.kernels.ops.moe.ep_moe_kernels import expand_to_masked_slab
+
+            num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
+            slab, slab_scale, masked_m = expand_to_masked_slab(
+                hidden_states,
+                hidden_states_scale,
+                psum_num_recv_tokens_per_expert,
+                num_local_experts,
+                deepep_v2_masked_max_m,
+                deepep_v2_expert_alignment,
+            )
+            running_state["deepep_v2_masked"] = True
+            running_state["deepep_v2_psum"] = psum_num_recv_tokens_per_expert
+            running_state["deepep_v2_total_expanded"] = deepep_v2_total_expanded
+            running_state["deepep_v2_expert_alignment"] = deepep_v2_expert_alignment
             return DeepGemmRunnerInput(
-                hidden_states=hidden_states,
-                hidden_states_scale=hidden_states_scale,
-                use_masked_gemm=False,
-                m_indices=psum_num_recv_tokens_per_expert,
-                use_psum_layout=True,
-                expected_m=epv2_expected_m,
+                hidden_states=slab,
+                hidden_states_scale=slab_scale,
+                use_masked_gemm=True,
+                masked_m=masked_m,
+                expected_m=deepep_v2_expected_m,
                 hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
             )
 
@@ -1208,12 +1233,6 @@ def pre_permute_epv2_to_deep_gemm(
     if psum_num_recv_tokens_per_expert is not None:
         all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
         num_recv_tokens_per_expert_gpu = None
-    elif isinstance(num_recv_tokens_per_expert, torch.Tensor):
-        num_recv_tokens_per_expert_gpu = num_recv_tokens_per_expert.to(torch.int32)
-        aligned_num_recv_tokens_per_expert = (
-            (num_recv_tokens_per_expert_gpu + 127) // 128
-        ) * 128
-        all_tokens = int(aligned_num_recv_tokens_per_expert.sum().item())
     else:
         num_recv_tokens_per_expert = [
             ceil_div(x, 128) * 128 for x in num_recv_tokens_per_expert
@@ -1230,7 +1249,12 @@ def pre_permute_epv2_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    input_tensor = torch.zeros(
+    # Match the legacy deepep_normal adapter (same ep_scatter + grouped GEMM): the
+    # scatter writes only real-token rows and the post-permute ep_gather reads them
+    # back via output_index, so the per-expert alignment padding rows are never
+    # consumed and the activation buffer needs no zero-init. The ue8m0 packed-scale
+    # layout keeps zeros (its in-int32 padding lanes must be zero).
+    input_tensor = torch.empty(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -1240,17 +1264,20 @@ def pre_permute_epv2_to_deep_gemm(
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = torch.zeros(
+        input_tensor_scale = torch.empty(
             (all_tokens, K // 128), device=hidden_states.device, dtype=torch.float32
         )
-    # all_tokens can include expert-aligned padding rows. The scatter kernel only
-    # writes real routed-token slots, so initialize padding m_indices to -1 to
-    # keep DeepGEMM from reading garbage expert ids for padded rows.
-    m_indices = torch.full(
-        (all_tokens,), -1, device=hidden_states.device, dtype=torch.int32
-    )
+    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
     if psum_num_recv_tokens_per_expert is not None:
+        # Contiguous-path alignment contract: this psum comes from ElasticBuffer
+        # dispatch(do_expand=False, expert_alignment=capability.expert_alignment),
+        # and DeepEP documents the non-expand psum as the inclusive prefix sum of
+        # alignment-PADDED per-expert counts (deep_ep/buffers/elastic.py). The
+        # deep_gemm capability pins expert_alignment=128 ==
+        # get_m_alignment_for_contiguous_layout(), so psum[e-1] is a valid
+        # 128-aligned group start for the contiguous grouped GEMM. Do NOT re-align
+        # here: an align_up would silently mask an upstream contract break.
         expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
         ep_scatter_from_psum(
             hidden_states,
@@ -1290,32 +1317,32 @@ def pre_permute_epv2_to_deep_gemm(
     )
 
 
-@register_post_permute("deep_gemm", "epv2")
-def post_permute_deep_gemm_to_epv2(
+@register_post_permute("deep_gemm", "deepep_v2")
+def post_permute_deep_gemm_to_deepep_v2(
     runner_output: DeepGemmRunnerOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> EpV2CombineInput:
+) -> DeepEPv2CombineInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
-    from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2CombineInput
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2CombineInput
 
-    if running_state.get("epv2_expanded", False):
+    if running_state.get("deepep_v2_expanded", False):
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
-        if running_state.get("epv2_masked", False):
+        if running_state.get("deepep_v2_masked", False):
             # Masked path: GEMM output is the [E_local, max_m, hidden] slab. Repack
             # it back to expanded row order (padding rows zeroed) before combine.
             from sglang.kernels.ops.moe.ep_moe_kernels import masked_slab_to_expand
 
             hidden_states = masked_slab_to_expand(
                 hidden_states,
-                running_state["epv2_psum"],
-                running_state["epv2_total_expanded"],
-                running_state["epv2_expert_alignment"],
+                running_state["deepep_v2_psum"],
+                running_state["deepep_v2_total_expanded"],
+                running_state["deepep_v2_expert_alignment"],
                 topk_weights=topk_weights,
             )
-            return EpV2CombineInput(hidden_states, None, None)
+            return DeepEPv2CombineInput(hidden_states, None, None)
         if topk_weights is not None:
             # Expanded combine does not consume top-k weights, so apply them to
             # each expert slot before combine. Keep this out-of-place until the
@@ -1323,7 +1350,7 @@ def post_permute_deep_gemm_to_epv2(
             hidden_states = hidden_states * topk_weights.to(
                 hidden_states.dtype
             ).unsqueeze(-1)
-        return EpV2CombineInput(hidden_states, None, None)
+        return DeepEPv2CombineInput(hidden_states, None, None)
 
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
@@ -1335,7 +1362,7 @@ def post_permute_deep_gemm_to_epv2(
         dtype=torch.bfloat16,
     )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
-    return EpV2CombineInput(
+    return DeepEPv2CombineInput(
         hidden_states=gather_out,
         topk_ids=topk_ids,
         topk_weights=topk_weights,

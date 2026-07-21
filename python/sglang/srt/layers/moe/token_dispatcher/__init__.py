@@ -1,3 +1,8 @@
+from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+    AscendTPCombineInput,
+    AscendTPDispatcher,
+    AscendTPDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -16,6 +21,11 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+    DeepEPv2CombineInput,
+    DeepEPv2Dispatcher,
+    DeepEPv2DispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
     FlashinferDispatchOutput,
@@ -31,11 +41,6 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPLLDispatchOutput,
     MoriEPNormalCombineInput,
     MoriEPNormalDispatchOutput,
-)
-from sglang.srt.layers.moe.token_dispatcher.epv2 import (
-    EpV2CombineInput,
-    EpV2Dispatcher,
-    EpV2DispatchOutput,
 )
 from sglang.srt.layers.moe.token_dispatcher.nixl import (
     NixlEPCombineInput,
@@ -67,9 +72,9 @@ __all__ = [
     "MoriEPLLDispatchOutput",
     "MoriEPLLCombineInput",
     "MoriEPDispatcher",
-    "EpV2Dispatcher",
-    "EpV2DispatchOutput",
-    "EpV2CombineInput",
+    "DeepEPv2Dispatcher",
+    "DeepEPv2DispatchOutput",
+    "DeepEPv2CombineInput",
     "NixlEPCombineInput",
     "NixlEPDispatchOutput",
     "NixlEPDispatcher",
@@ -82,4 +87,7 @@ __all__ = [
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
+    "AscendTPDispatcher",
+    "AscendTPDispatchOutput",
+    "AscendTPCombineInput",
 ]
