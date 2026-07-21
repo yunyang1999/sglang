@@ -16,6 +16,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.utils import get_device_sm
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +266,10 @@ def should_deepgemm_weight_requant_ue8m0(
         and weight_block_size is not None
     ):
         return False
+    # SM120 routes dense block-FP8 GEMMs to CUTLASS/Triton (fp32 scales);
+    # only the grouped MoE GEMM consumes DeepGEMM layouts there.
+    if get_device_sm() == 120:
+        return False
     if output_dtype is not None and output_dtype != torch.bfloat16:
         return False
     if weight_shape is not None and (
@@ -312,3 +317,14 @@ def maybe_executor_submit(
         futures.append(executor.submit(func, *func_args, **func_kwargs))
     else:
         func(*func_args, **func_kwargs)
+
+
+def resolve_language_model(model: nn.Module) -> nn.Module:
+    model_cls_name = model.__class__.__name__
+    if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
+        return model.thinker.model
+    if hasattr(model, "model"):
+        return model.model
+    if hasattr(model, "language_model"):
+        return model.language_model
+    return model.model

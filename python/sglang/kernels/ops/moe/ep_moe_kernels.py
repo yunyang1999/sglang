@@ -700,6 +700,68 @@ def silu_and_mul_masked_fwd(
 
 
 @triton.jit
+def silu_mul_dynamic_scale_triton_kernel_for_cutlass_moe(
+    input_ptr,
+    scale_ptr,
+    num_tokens_tensor_ptr,
+    intermediate_size,
+    fp8_max,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    num_tokens = tl.load(num_tokens_tensor_ptr)
+    numel = num_tokens * intermediate_size
+    gate_ptr = input_ptr
+    up_ptr = input_ptr + intermediate_size
+
+    start_idx = tl.program_id(0) * BLOCK_SIZE
+    step = tl.num_programs(0) * BLOCK_SIZE
+    absmax = 0.0
+
+    for id in tl.range(start_idx, numel, step, num_stages=NUM_STAGES):
+        ids = id + tl.arange(0, BLOCK_SIZE)
+        token_ids = ids // intermediate_size
+        mask = ids < numel
+
+        offs = ids + token_ids * intermediate_size
+        gate = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        gate_up = gate / (1 + tl.exp(-gate)) * up
+        absmax = tl.maximum(absmax, tl.max(tl.abs(gate_up)))
+
+    absmax = tl.maximum(absmax, 1e-10)
+    tl.atomic_max(scale_ptr, absmax / fp8_max)
+
+
+def silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    scale: torch.Tensor,
+    num_tokens_tensor: torch.Tensor,
+    expected_num_tokens: int,
+    intermediate_size: int,
+):
+    grid, block_dim = _get_launch_config_1d(
+        input.device, expected_num_tokens * intermediate_size
+    )
+    scale.zero_()
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    silu_mul_dynamic_scale_triton_kernel_for_cutlass_moe[grid](
+        input_ptr=input,
+        scale_ptr=scale,
+        num_tokens_tensor_ptr=num_tokens_tensor,
+        intermediate_size=intermediate_size,
+        fp8_max=fp8_max,
+        BLOCK_SIZE=block_dim,
+        NUM_STAGES=3,
+    )
+    silu_mul_static_tensorwise_quant_for_cutlass_moe(
+        input, output, scale, num_tokens_tensor, expected_num_tokens, intermediate_size
+    )
+
+
+@triton.jit
 def silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe(
     input_ptr,
     output_ptr,
@@ -1714,7 +1776,14 @@ def moe_ep_deepgemm_preprocess(
         )
         gateup_input_scale = gateup_input_scale.transpose(1, 2)
     elif is_fp8:
-        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+
+        # When DeepGEMM dequantizes with UE8M0 scales, the FP8 values must be
+        # quantized with power-of-two scales; a plain quant followed by the
+        # round-up e8m0 cast downstream would inflate each group by up to 2x.
+        hidden_states, scale = per_token_group_quant_fp8(
+            hidden_states, block_k, scale_ue8m0=DEEPGEMM_SCALE_UE8M0
+        )
         gateup_input_scale = torch.empty(
             (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
             device=hidden_states.device,
