@@ -38,8 +38,8 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
@@ -133,8 +133,8 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
-    elif a2a_backend.is_epv2():
-        return EpV2Dispatcher(
+    elif a2a_backend.is_deepep_v2():
+        return DeepEPv2Dispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,

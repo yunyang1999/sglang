@@ -27,8 +27,8 @@ if TYPE_CHECKING:
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
-        EpV2CombineInput,
-        EpV2DispatchOutput,
+        DeepEPv2CombineInput,
+        DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
         StandardCombineInput,
@@ -168,10 +168,10 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_flashinfer()
 
     @staticmethod
-    def format_is_epv2(
+    def format_is_deepep_v2(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[EpV2DispatchOutput]:
-        return dispatch_output.format.is_epv2()
+    ) -> TypeGuard[DeepEPv2DispatchOutput]:
+        return dispatch_output.format.is_deepep_v2()
 
 
 class DispatchOutputFormat(Enum):
@@ -180,7 +180,7 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
-    EPV2 = "epv2"
+    DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
 
     def is_standard(self) -> bool:
@@ -204,8 +204,8 @@ class DispatchOutputFormat(Enum):
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
 
-    def is_epv2(self) -> bool:
-        return self == DispatchOutputFormat.EPV2
+    def is_deepep_v2(self) -> bool:
+        return self == DispatchOutputFormat.DEEPEP_V2
 
 
 @runtime_checkable
@@ -262,10 +262,10 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
     @staticmethod
-    def format_is_epv2(
+    def format_is_deepep_v2(
         combine_input: CombineInput,
-    ) -> TypeGuard[EpV2CombineInput]:
-        return combine_input.format == CombineInputFormat.EPV2
+    ) -> TypeGuard[DeepEPv2CombineInput]:
+        return combine_input.format == CombineInputFormat.DEEPEP_V2
 
 
 class CombineInputFormat(Enum):
@@ -273,7 +273,7 @@ class CombineInputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
-    EPV2 = "epv2"
+    DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
 
 

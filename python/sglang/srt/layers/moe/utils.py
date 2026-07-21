@@ -12,7 +12,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -36,7 +41,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
-    EPV2 = "epv2"
+    DEEPEP_V2 = "deepep_v2"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -75,8 +80,8 @@ class MoeA2ABackend(Enum):
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
 
-    def is_epv2(self):
-        return self == MoeA2ABackend.EPV2
+    def is_deepep_v2(self):
+        return self == MoeA2ABackend.DEEPEP_V2
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -160,7 +165,7 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.AITER
 
 
-class EpV2OutputDtype(Enum):
+class DeepEPv2OutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP v2.
 
@@ -172,15 +177,17 @@ class EpV2OutputDtype(Enum):
     FP8 = "fp8"
 
 
-class EpV2RunnerCapability(NamedTuple):
+class DeepEPv2RunnerCapability(NamedTuple):
     """
-    Describes the EPv2 dispatcher contract required by the active MoE runner.
+    Describes the DeepEP v2 dispatcher contract required by the active MoE runner.
 
-    The dispatcher should depend on this explicit contract instead of peeking at
-    runner implementation details such as DeepGEMM JIT flags.
+    This capability is resolved once (in get_deepep_v2_runner_capability, which reads
+    runner-side flags such as DeepGEMM JIT TMA/UE8M0 settings) and then consumed
+    by the dispatcher. The dispatcher depends only on this resolved contract and
+    does not peek at runner implementation details itself.
     """
 
-    output_dtype: EpV2OutputDtype
+    output_dtype: DeepEPv2OutputDtype
     expert_alignment: int
     fp8_scale_tma_aligned: bool = False
     fp8_scale_ue8m0: bool = False
@@ -306,7 +313,7 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
     return DispatcherOutputDtype.BF16
 
 
-def get_epv2_output_dtype(self) -> EpV2OutputDtype:
+def get_deepep_v2_output_dtype(self) -> DeepEPv2OutputDtype:
     """
     Automatically choose the dispatch output dtype for DeepEP v2.
 
@@ -318,32 +325,32 @@ def get_epv2_output_dtype(self) -> EpV2OutputDtype:
     """
 
     server_args = get_server_args()
-    if server_args and server_args.epv2_dispatcher_output_dtype != "auto":
-        return EpV2OutputDtype(server_args.epv2_dispatcher_output_dtype)
+    if server_args and server_args.deepep_v2_dispatcher_output_dtype != "auto":
+        return DeepEPv2OutputDtype(server_args.deepep_v2_dispatcher_output_dtype)
 
     if self.quant_config is not None:
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
-            return EpV2OutputDtype(dispatcher_output_dtype)
+            return DeepEPv2OutputDtype(dispatcher_output_dtype)
 
     runner_backend = get_moe_runner_backend()
     if runner_backend.is_deep_gemm():
-        return EpV2OutputDtype.FP8
+        return DeepEPv2OutputDtype.FP8
     if runner_backend.is_triton():
-        return EpV2OutputDtype.BF16
+        return DeepEPv2OutputDtype.BF16
 
     raise ValueError(
         "DeepEP v2 auto dispatcher output dtype only supports deep_gemm and triton "
         f"runner backends for now, got {runner_backend.value}. Set "
-        "--epv2-dispatcher-output-dtype explicitly only after adding a matching "
+        "--deepep-v2-dispatcher-output-dtype explicitly only after adding a matching "
         "DeepEP v2 runner adapter."
     )
 
 
-def get_epv2_runner_capability(self) -> EpV2RunnerCapability:
-    output_dtype = get_epv2_output_dtype(self)
+def get_deepep_v2_runner_capability(self) -> DeepEPv2RunnerCapability:
+    output_dtype = get_deepep_v2_output_dtype(self)
     runner_backend = get_moe_runner_backend()
-    if output_dtype == EpV2OutputDtype.FP8:
+    if output_dtype == DeepEPv2OutputDtype.FP8:
         if not runner_backend.is_deep_gemm():
             raise ValueError(
                 "DeepEP v2 FP8 dispatch output currently requires "
@@ -352,16 +359,17 @@ def get_epv2_runner_capability(self) -> EpV2RunnerCapability:
             )
         from sglang.srt.layers import deep_gemm_wrapper
 
-        # DeepGEMM consumes expert-major grouped activations. Use EPv2's
+        # DeepGEMM consumes expert-major grouped activations. Use DeepEP v2's
         # native expanded layout so the dispatcher copy epilogue writes one
         # row per local expert slot, avoiding an extra SGLang scatter/gather
-        # adapter round-trip on the decode path. Scale layout follows the
-        # DeepGEMM wrapper capability: SM100/SM120 MXFP4 paths use packed
-        # UE8M0 scales, while Hopper keeps regular/TMA-aligned float scales.
-        return EpV2RunnerCapability(
+        # adapter round-trip on the decode path.
+        return DeepEPv2RunnerCapability(
             output_dtype=output_dtype,
             expert_alignment=128,
-            fp8_scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            fp8_scale_tma_aligned=(
+                deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+                or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            ),
             fp8_scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             use_expanded_layout=True,
         )
@@ -370,7 +378,7 @@ def get_epv2_runner_capability(self) -> EpV2RunnerCapability:
             "DeepEP v2 BF16 dispatch output currently requires "
             f"--moe-runner-backend triton. Got {runner_backend.value}."
         )
-    return EpV2RunnerCapability(output_dtype=output_dtype, expert_alignment=1)
+    return DeepEPv2RunnerCapability(output_dtype=output_dtype, expert_alignment=1)
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -479,48 +487,6 @@ def uses_per_rank_fused_shared_slots() -> bool:
 def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
     """Check whether this layer has fused shared experts in per-rank slots."""
     return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
-
-
-def uses_a2a_moe_forward() -> bool:
-    """Return whether the active backend uses the A2A MoE forward path."""
-    b = get_moe_a2a_backend()
-    return (
-        b.is_deepep()
-        or b.is_mooncake()
-        or b.is_nixl()
-        or b.is_mori()
-        or b.is_ascend_fuseep()
-        or b.is_flashinfer()
-        or b.is_epv2()
-    )
-
-
-def uses_a2a_expert_parallel_metadata() -> bool:
-    """Return whether the backend needs EP metadata on DeepSeek MoE layers."""
-    b = get_moe_a2a_backend()
-    return (
-        b.is_deepep()
-        or b.is_mooncake()
-        or b.is_nixl()
-        or b.is_mori()
-        or b.is_ascend_fuseep()
-        or b.is_epv2()
-    )
-
-
-def requires_shared_expert_tp1() -> bool:
-    """Return whether shared experts should be materialized with TP=1."""
-    b = get_moe_a2a_backend()
-    return (
-        b.is_deepep()
-        or b.is_mooncake()
-        or b.is_nixl()
-        or b.is_mori()
-        or b.is_ascend_fuseep()
-        or b.is_flashinfer()
-        or b.is_megamoe()
-        or b.is_epv2()
-    )
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
