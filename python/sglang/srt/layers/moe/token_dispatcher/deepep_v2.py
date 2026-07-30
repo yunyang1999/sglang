@@ -352,15 +352,23 @@ class _DeepEPv2Impl:
         if self._uses_fp8_dispatch_output():
             _ensure_fp8_quant_available()
             if use_masked:
-                # _run_masked_gemm consumes plain per-token-group fp32 scales and
-                # does its own e8m0/tma-major alignment, so dispatch a plain
-                # row-major scale (no col-major, no tma, no e8m0 pre-pack).
+                # _run_masked_gemm consumes row-major per-token-group scales and
+                # does its own e8m0 packing / tma-major alignment, so dispatch a
+                # plain row-major scale (no col-major, no tma pre-pack).
+                # scale_ue8m0 must still follow the runner capability: the
+                # downstream _cast_to_e8m0_with_rounding_up() rounds each scale UP
+                # to a power of two, which is only lossless when the quantizer
+                # already divided the data by that same power-of-two scale.
+                # Passing False here inflates every group by up to 2x (the same
+                # trap called out in ep_moe_kernels.py's fp8 gateup path). The
+                # row-major ue8m0 scale stays fp32 [T, K/128] contiguous, so the
+                # dispatch wire format is unchanged.
                 dispatch_x = sglang_per_token_group_quant_fp8(
                     hidden_states,
                     _SCALE_BLOCK_SIZE,
                     column_major_scales=False,
                     scale_tma_aligned=False,
-                    scale_ue8m0=False,
+                    scale_ue8m0=self.capability.fp8_scale_ue8m0,
                 )
                 use_tma_aligned_col_major_sf = False
             else:
