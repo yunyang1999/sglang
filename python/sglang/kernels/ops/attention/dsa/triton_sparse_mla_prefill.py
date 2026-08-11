@@ -63,6 +63,33 @@ equivalent to the base path, not approximations):
     random indices do not have that structure and understate the path badly —
     benchmark it on captured indices, not synthetic ones.
 
+How the two carry over to DeepSeek-V4 (SM120, RTX 5080, measured 2026-08-10 at
+T=4096, h=8, d_qk=d_v=512, combined topk=640):
+
+* ``union`` transfers, but on a tighter margin than GLM, because DSv4 gathers
+  640 rows where GLM gathers 2048 — less work to amortise the mark/compact
+  passes against. Sweeping the neighbour-retention of the top-k half:
+
+      retention   union size (G=4)   speedup
+        0.50           2.02x          0.86x   <- loses
+        0.75           1.54x          1.35x
+        0.90           1.26x          1.62x
+        0.97           1.12x          1.76x
+
+  128 of the 640 rows are the sliding window, which shifts by exactly one
+  position per query token, so G neighbours share ``128 - (G-1)`` of them
+  whatever the indexer does. The other 512 are the indexer's, and its real
+  retention is a property of the trained model — it is not measured here, so
+  ``union`` stays opt-in for DSv4 and wants a captured-index check before it is
+  turned on. (For calibration the same sweep on the GLM shape wins 1.17x even at
+  a 1.88x union size, so the break-even is shape-dependent, not a fixed ratio.)
+
+* ``dense_prefix`` does **not** transfer. DSv4's prefix region is only 640 tokens
+  deep against GLM's 2048, and at that depth the dense tile is no faster than the
+  per-token path: 0.98x at T=640 (100% covered), 0.89x at 1024, 0.95x at 2048,
+  0.98x at 4096, 0.99x at 8192. Leave it off for DSv4; the exact-set guard makes
+  enabling it harmless but pointless.
+
 All tunables are explicit arguments — the module reads no environment
 variables. If a tuned tile exceeds the device shared-memory budget (e.g. a
 large head count on SM120's 100 KB), the launcher steps down through smaller
@@ -83,6 +110,10 @@ _PINNED = {
     (12, 0): (64, 4, 2),  # SM120, swept at T=8192
     (12, 1): (64, 4, 2),
 }
+# The SM120 entry was swept on the GLM shape (d_qk=576, topk=2048). Re-swept on
+# DeepSeek-V4's (d_qk=d_v=512, topk=640, T=8192, h=8): (64, 4, 2) is still the
+# optimum -- 27 configs, the runner-up (128, 4, 2) is 0.995x and the best is
+# 1.004x, both inside the 17 us run-to-run sigma. No DSv4-specific entry needed.
 _UNTUNED_DEFAULT = (64, 8, 3)
 
 
@@ -233,6 +264,7 @@ def _dense_prefix_kernel(
     q_ptr,
     kv_ptr,
     o_ptr,
+    sink_ptr,  # [H] fp32; unused when not HAS_SINK
     sm_scale,
     P,
     H: tl.constexpr,
@@ -240,6 +272,7 @@ def _dense_prefix_kernel(
     D_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     h = tl.program_id(1)
@@ -250,11 +283,14 @@ def _dense_prefix_kernel(
     rows = m0 + m
     rmask = rows < P
     dv = tl.arange(0, D_V)
-    dt = tl.arange(0, D_TAIL)
 
     qb = q_ptr + (rows * H + h).to(tl.int64)[:, None] * D_QK
     q_main = tl.load(qb + dv[None, :], mask=rmask[:, None], other=0.0)
-    q_tail = tl.load(qb + (D_V + dt)[None, :], mask=rmask[:, None], other=0.0)
+    # DeepSeek-V4 has no rope tail (D_QK == D_V); tl.arange(0, 0) does not compile,
+    # so the tail is elided at trace time rather than masked.
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+        q_tail = tl.load(qb + (D_V + dt)[None, :], mask=rmask[:, None], other=0.0)
 
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
@@ -267,9 +303,11 @@ def _dense_prefix_kernel(
     for k0 in tl.range(0, safe_lo, BLOCK_N):  # fully-unmasked blocks
         kb = kv_ptr + (k0 + n).to(tl.int64)[:, None] * D_QK
         kv_main = tl.load(kb + dv[None, :])
-        kv_tail = tl.load(kb + (D_V + dt)[None, :])
         qk = tl.dot(q_main, tl.trans(kv_main))
-        qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * sm_scale
+        if D_TAIL > 0:
+            kv_tail = tl.load(kb + (D_V + dt)[None, :])
+            qk = tl.dot(q_tail, tl.trans(kv_tail), qk)
+        qk = qk * sm_scale
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(qk - m_new[:, None])
@@ -282,9 +320,11 @@ def _dense_prefix_kernel(
         cmask = (k0 + n) < P
         kb = kv_ptr + tl.where(cmask, k0 + n, 0).to(tl.int64)[:, None] * D_QK
         kv_main = tl.load(kb + dv[None, :], mask=cmask[:, None], other=0.0)
-        kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=cmask[:, None], other=0.0)
         qk = tl.dot(q_main, tl.trans(kv_main))
-        qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * sm_scale
+        if D_TAIL > 0:
+            kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=cmask[:, None], other=0.0)
+            qk = tl.dot(q_tail, tl.trans(kv_tail), qk)
+        qk = qk * sm_scale
         causal = (k0 + n)[None, :] <= rows[:, None]
         qk = tl.where(causal & cmask[None, :], qk, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -295,13 +335,25 @@ def _dense_prefix_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(kv_main.dtype), kv_main)
         m_i = m_new
 
+    if HAS_SINK:
+        # One head per program, so the sink is a scalar here. Same combined-max
+        # rescale as the base path: acc and l_i are both held at m_base.
+        sink = tl.load(sink_ptr + h).to(tl.float32)
+        m_base = tl.where(m_i == -float("inf"), 0.0, m_i)
+        m_comb = tl.maximum(m_base, sink)
+        rescale = tl.exp(m_base - m_comb)
+        l_i = l_i * rescale + tl.exp(sink - m_comb)
+        acc = acc * rescale[:, None]
+
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     acc = acc / l_safe[:, None]
     ob = o_ptr + (rows * H + h).to(tl.int64)[:, None] * D_V
     tl.store(ob + dv[None, :], acc.to(o_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
-def _dense_prefix_path(q, kv, indices, sm_scale, d_v, out, dense_config=None):
+def _dense_prefix_path(
+    q, kv, indices, sm_scale, d_v, out, dense_config=None, attn_sink=None
+):
     """Handle rows [0, P) densely when they provably selected their full prefix.
     Returns P (rows handled; 0 = not applicable). Exact-set gate: with unique
     indices, count==t+1 & min==base & max==base+t pin the set to base+{0..t}."""
@@ -333,6 +385,7 @@ def _dense_prefix_path(q, kv, indices, sm_scale, d_v, out, dense_config=None):
         q[:P],
         kv[b:],
         out[:P],
+        attn_sink if attn_sink is not None else out,  # unread placeholder
         sm_scale,
         P,
         H=h,
@@ -342,6 +395,7 @@ def _dense_prefix_path(q, kv, indices, sm_scale, d_v, out, dense_config=None):
         BLOCK_N=bn,
         num_warps=warps,
         num_stages=stages,
+        HAS_SINK=attn_sink is not None,
     )
     return P
 
@@ -422,6 +476,7 @@ def _nsa_prefill_union_kernel(
     ubits_ptr,
     ulen_ptr,
     o_ptr,
+    sink_ptr,  # [H] fp32; unused when not HAS_SINK
     sm_scale,
     U_CAP,
     base,
@@ -430,6 +485,7 @@ def _nsa_prefill_union_kernel(
     D_QK: tl.constexpr,
     D_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     g = tl.program_id(0)
     D_TAIL: tl.constexpr = D_QK - D_V
@@ -438,11 +494,13 @@ def _nsa_prefill_union_kernel(
     r = tl.arange(0, GH)
     tok_of_row = r // H
     dv = tl.arange(0, D_V)
-    dt = tl.arange(0, D_TAIL)
 
     qb = q_ptr + g.to(tl.int64) * GH * D_QK
     q_main = tl.load(qb + r[:, None] * D_QK + dv[None, :])
-    q_tail = tl.load(qb + r[:, None] * D_QK + (D_V + dt)[None, :])
+    # DeepSeek-V4 has no rope tail (D_QK == D_V) -- elide it at trace time.
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+        q_tail = tl.load(qb + r[:, None] * D_QK + (D_V + dt)[None, :])
 
     m_i = tl.full([GH], -float("inf"), tl.float32)
     l_i = tl.zeros([GH], tl.float32)
@@ -459,12 +517,14 @@ def _nsa_prefill_union_kernel(
         row = (tl.where(valid, uidx, 0) + base).to(tl.int64)
         kb = kv_ptr + row * D_QK
         kv_main = tl.load(kb[:, None] + dv[None, :], mask=valid[:, None], other=0.0)
-        kv_tail = tl.load(
-            kb[:, None] + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        )
 
         qk = tl.dot(q_main, tl.trans(kv_main))
-        qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * sm_scale
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kb[:, None] + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+            )
+            qk = tl.dot(q_tail, tl.trans(kv_tail), qk)
+        qk = qk * sm_scale
         sel = ((bits[None, :] >> tok_of_row[:, None]) & 1) != 0
         qk = tl.where(sel & valid[None, :], qk, -float("inf"))
 
@@ -476,6 +536,16 @@ def _nsa_prefill_union_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(kv_main.dtype), kv_main)
         m_i = m_new
 
+    if HAS_SINK:
+        # Rows are (token, head) pairs laid out head-fastest, so the sink lane is
+        # r % H. Same combined-max rescale as the base path.
+        sink = tl.load(sink_ptr + (r % H)).to(tl.float32)
+        m_base = tl.where(m_i == -float("inf"), 0.0, m_i)
+        m_comb = tl.maximum(m_base, sink)
+        rescale = tl.exp(m_base - m_comb)
+        l_i = l_i * rescale + tl.exp(sink - m_comb)
+        acc = acc * rescale[:, None]
+
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     acc = acc / l_safe[:, None]
     tl.store(
@@ -484,7 +554,9 @@ def _nsa_prefill_union_kernel(
     )
 
 
-def _union_path(q, kv, indices, sm_scale, d_v, out, G, union_config=None):
+def _union_path(
+    q, kv, indices, sm_scale, d_v, out, G, union_config=None, attn_sink=None
+):
     """Returns True if handled. Budget-gated; tail rows (T % G) fall back."""
     T, h, d_qk = q.shape
     K = indices.shape[-1]
@@ -574,6 +646,7 @@ def _union_path(q, kv, indices, sm_scale, d_v, out, G, union_config=None):
                 ubits,
                 ulen,
                 out[:T_main],
+                attn_sink if attn_sink is not None else ulen,  # unread placeholder
                 sm_scale,
                 U_CAP,
                 vmin,
@@ -584,6 +657,7 @@ def _union_path(q, kv, indices, sm_scale, d_v, out, G, union_config=None):
                 BLOCK_N=bn_try,
                 num_warps=warps,
                 num_stages=ns_try,
+                HAS_SINK=attn_sink is not None,
             )
             break
         except triton.runtime.errors.OutOfResources:
@@ -597,6 +671,7 @@ def _union_path(q, kv, indices, sm_scale, d_v, out, G, union_config=None):
             indices[T_main:],
             sm_scale,
             d_v,
+            attn_sink=attn_sink,
             out=out[T_main:],
             union=False,
         )
@@ -684,7 +759,7 @@ def sparse_mla_prefill(
             head is both the key and the whole value.
         attn_sink: optional ``[H]`` fp32 learned per-head sink logit (DeepSeek-V4).
             Joins the softmax denominator without contributing a value row, i.e.
-            ``logaddexp(lse, sink)``. Base path only.
+            ``logaddexp(lse, sink)``. Supported on all three paths.
         topk_length: optional ``[T]`` int32 per-row valid count. Computed from
             ``indices`` when omitted; pass it to skip that reduction.
         out: optional preallocated ``[T, H, d_v]`` bf16 output.
@@ -708,19 +783,6 @@ def sparse_mla_prefill(
     topk = indices.shape[-1]
     if d_qk < d_v:
         raise ValueError(f"d_v ({d_v}) cannot exceed the query width ({d_qk}).")
-    if (union or dense) and d_qk == d_v:
-        # Both fast-path kernels build the rope tail with tl.arange(0, d_qk - d_v);
-        # a zero-width tail is a compile error there, not a no-op.
-        raise ValueError(
-            "the union and dense-prefix fast paths need a non-empty rope tail "
-            f"(d_qk > d_v); got d_qk = d_v = {d_v}. Run the base path for this "
-            "model."
-        )
-    if (union or dense) and attn_sink is not None:
-        raise ValueError(
-            "attn_sink is implemented on the base path only; the union and "
-            "dense-prefix kernels would drop it silently."
-        )
     if attn_sink is not None:
         if attn_sink.shape != (h,):
             raise ValueError(
@@ -732,9 +794,9 @@ def sparse_mla_prefill(
         # The base path carries a padded value tile, but the union and
         # dense-prefix kernels still index the value dim directly, so a
         # non-power-of-two d_v would silently mis-tile there. (DeepSeek-V4 is not
-        # such a model: sglang hands it d_v = head_dim = 512 -- see the zero-tail
-        # guard above -- so the 448 case is a spare-capacity path, not the DSv4
-        # one.)
+        # such a model: sglang hands it d_v = head_dim = 512, a power of two with
+        # a zero-width tail, so both fast paths are open to it -- the 448 case is
+        # spare capacity, not the DSv4 one.)
         raise ValueError(
             f"the union and dense-prefix fast paths need a power-of-two d_v; "
             f"got {d_v}. Run the base path for this model."
@@ -745,7 +807,9 @@ def sparse_mla_prefill(
         out = torch.empty(T, h, d_v, dtype=torch.bfloat16, device=q.device)
 
     if dense:
-        P = _dense_prefix_path(q, kv, indices, sm_scale, d_v, out, dense_config)
+        P = _dense_prefix_path(
+            q, kv, indices, sm_scale, d_v, out, dense_config, attn_sink=attn_sink
+        )
         if P >= T:
             return out
         if P > 0:  # remainder continues through the normal (or union) path below
@@ -763,7 +827,7 @@ def sparse_mla_prefill(
             return out
 
     if union in (2, 4) and _union_path(
-        q, kv, indices, sm_scale, d_v, out, union, union_config
+        q, kv, indices, sm_scale, d_v, out, union, union_config, attn_sink=attn_sink
     ):
         return out
 

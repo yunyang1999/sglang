@@ -261,17 +261,41 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
                     f"d_qk == d_v == {d}, h={h}",
                 )
 
-    def test_no_rope_tail_refused_by_fast_paths(self):
-        # The union and dense-prefix kernels build the tail with tl.arange too,
-        # so a zero-width tail must be refused up front, not compiled.
-        T, topk, S, d = 256, 512, 1024, 512
-        g = torch.Generator(device="cuda").manual_seed(81)
+    def test_no_rope_tail_union(self):
+        # The union tile is where the DSv4 win lives: its combined index set is
+        # SWA(128) + top-k(512), and the SWA half shifts by exactly one position
+        # per query token, so G neighbours share 128 + (G-1) of those rows by
+        # construction. Same zero-width-tail elision as the base path.
+        T, topk, S, d = 2048, 640, 4096, 512
+        for group in (2, 4):
+            with self.subTest(group=group):
+                g = torch.Generator(device="cuda").manual_seed(82 + group)
+                q = torch.randn(T, 8, d, dtype=torch.bfloat16, device="cuda", generator=g)
+                kv = torch.randn(S, d, dtype=torch.bfloat16, device="cuda", generator=g)
+                idx = _overlapping_indices(T, topk, S, g)
+                self._assert_matches(
+                    sparse_mla_prefill(q, kv, idx, SM_SCALE, d, union=group),
+                    _reference(q, kv, idx, d),
+                    f"union G={group}, tail=0",
+                )
+
+    def test_no_rope_tail_dense_prefix(self):
+        # Dense-prefix at DSv4's shape. Its payoff is smaller here than on GLM
+        # (topk 640 vs 2048 means fewer tokens cover their whole prefix), but the
+        # exact-set guard makes enabling it safe either way.
+        T, topk, d = 1024, 1024, 512
+        g = torch.Generator(device="cuda").manual_seed(84)
         q = torch.randn(T, 8, d, dtype=torch.bfloat16, device="cuda", generator=g)
-        kv = torch.randn(S, d, dtype=torch.bfloat16, device="cuda", generator=g)
-        idx = _random_indices(T, topk, S, g)
-        for kwargs in ({"union": 2}, {"dense": True}):
-            with self.assertRaisesRegex(ValueError, "non-empty rope tail"):
-                sparse_mla_prefill(q, kv, idx, SM_SCALE, d, **kwargs)
+        kv = torch.randn(T, d, dtype=torch.bfloat16, device="cuda", generator=g)
+        idx = torch.full((T, topk), -1, dtype=torch.int32, device="cuda")
+        for t in range(T):
+            n = min(t + 1, topk)
+            idx[t, :n] = torch.arange(n, dtype=torch.int32, device="cuda")
+        self._assert_matches(
+            sparse_mla_prefill(q, kv, idx, SM_SCALE, d, dense=True),
+            _reference(q, kv, idx, d),
+            "dense-prefix, tail=0",
+        )
 
     def test_attn_sink(self):
         # DeepSeek-V4 carries a learned per-head sink logit into every softmax
@@ -306,16 +330,55 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
         out = sparse_mla_prefill(q, kv, idx, SM_SCALE, d, attn_sink=sink)
         self.assertTrue(torch.equal(out, torch.zeros_like(out)))
 
-    def test_attn_sink_refused_by_fast_paths(self):
-        # The union and dense-prefix kernels have no sink term; taking one and
-        # ignoring it would be a silent accuracy loss.
-        T, topk, S = 256, 512, 1024
-        q, kv, g = _qkv(T, S, 8, seed=92)
-        idx = _random_indices(T, topk, S, g)
+    def test_attn_sink_on_union(self):
+        # DSv4 always carries a sink, so a fast path that cannot take one is a
+        # fast path DSv4 cannot use. Union rows are (token, head) laid out
+        # head-fastest -- a wrong sink lane here mixes heads and still looks
+        # roughly right, so check it against the per-head reference.
+        T, topk, S, d = 2048, 640, 4096, 512
+        for group in (2, 4):
+            with self.subTest(group=group):
+                g = torch.Generator(device="cuda").manual_seed(93 + group)
+                q = torch.randn(T, 8, d, dtype=torch.bfloat16, device="cuda", generator=g)
+                kv = torch.randn(S, d, dtype=torch.bfloat16, device="cuda", generator=g)
+                idx = _overlapping_indices(T, topk, S, g)
+                sink = torch.randn(8, dtype=torch.float32, device="cuda", generator=g)
+                self._assert_matches(
+                    sparse_mla_prefill(
+                        q, kv, idx, SM_SCALE, d, attn_sink=sink, union=group
+                    ),
+                    _reference(q, kv, idx, d, attn_sink=sink),
+                    f"union G={group} + attn_sink",
+                )
+
+    def test_attn_sink_on_dense_prefix(self):
+        T, topk, d = 1024, 1024, 512
+        g = torch.Generator(device="cuda").manual_seed(95)
+        q = torch.randn(T, 8, d, dtype=torch.bfloat16, device="cuda", generator=g)
+        kv = torch.randn(T, d, dtype=torch.bfloat16, device="cuda", generator=g)
+        idx = torch.full((T, topk), -1, dtype=torch.int32, device="cuda")
+        for t in range(T):
+            n = min(t + 1, topk)
+            idx[t, :n] = torch.arange(n, dtype=torch.int32, device="cuda")
         sink = torch.randn(8, dtype=torch.float32, device="cuda", generator=g)
-        for kwargs in ({"union": 2}, {"dense": True}):
-            with self.assertRaisesRegex(ValueError, "base path only"):
-                sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, attn_sink=sink, **kwargs)
+        self._assert_matches(
+            sparse_mla_prefill(q, kv, idx, SM_SCALE, d, attn_sink=sink, dense=True),
+            _reference(q, kv, idx, d, attn_sink=sink),
+            "dense-prefix + attn_sink",
+        )
+
+    def test_attn_sink_on_glm_shape_fast_paths(self):
+        # The sink must also survive the tail>0 form of both fast paths, so the
+        # two shapes do not diverge into separately-maintained code.
+        T, topk, S = 2048, 2048, 4096
+        q, kv, g = _qkv(T, S, 8, seed=96)
+        idx = _overlapping_indices(T, topk, S, g)
+        sink = torch.randn(8, dtype=torch.float32, device="cuda", generator=g)
+        self._assert_matches(
+            sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, attn_sink=sink, union=4),
+            _reference(q, kv, idx, D_V, attn_sink=sink),
+            "GLM shape, union=4 + attn_sink",
+        )
 
     def test_deterministic(self):
         # No split-K / atomics / partial merge, so repeated calls must be
