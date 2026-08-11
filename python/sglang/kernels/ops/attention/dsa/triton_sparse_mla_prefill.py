@@ -3131,7 +3131,7 @@ def _nsa_decode_split_paged_fp8_native_kernel(
 #   tile per split still amortises the split's fixed cost (a 7-chunk Q
 #   quantisation, an epilogue and a 512-wide partial write).
 _NATIVE_TILE = (64, 4, 2)  # (BLOCK_N, warps, stages); None -> `_config`
-_NATIVE_BLOCK_H = 8  # rows of the head mma tile; None -> `_block_h`
+_NATIVE_BLOCK_H = 8  # floor for the head mma tile; raised to cover wider h
 _MIN_CHUNKS_NATIVE = 1  # tiles per split below which a split does not pay
 _MAX_WAVES_NATIVE = 1  # waves of `_BLOCKS_PER_SM` blocks before splitting loses
 
@@ -3314,7 +3314,11 @@ def sparse_mla_prefill_paged_fp8_native(
         bn = max(32, bn)
     else:
         bn, warps, stages = _native_config(q.device, h)
-    block_h = block_h or _NATIVE_BLOCK_H or _block_h(q.device, h)
+    # `_NATIVE_BLOCK_H` is a *floor* swept at DeepSeek-V4's post-TP8 h=8, not a
+    # value: the head mma tile must still cover every head, so a wider head count
+    # raises it. Applying it unconditionally computed only the first 8 rows and
+    # left the rest undefined (cos 0.58 at h=16).
+    block_h = block_h or max(_NATIVE_BLOCK_H or 0, triton.next_power_of_2(h))
     # Byte offsets, not element offsets: a pool is `num_pages * bytes_per_page`
     # bytes, so int32 addressing holds only for pools under 2 GiB.
     if int64_indexing is None:

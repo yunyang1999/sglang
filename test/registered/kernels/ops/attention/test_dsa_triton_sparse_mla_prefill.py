@@ -569,3 +569,165 @@ class TestPagedFP8SparseMLAPrefill(CustomTestCase):
             ref,
             "SWA pool + compressed pool",
         )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestSplitKDecode(CustomTestCase):
+    """Split-K decode. The property that matters is that it changes nothing
+    unless asked: ``splits=1`` must be the existing kernel, bit for bit."""
+
+    def test_splits_one_is_bitwise_identical(self):
+        S, topk = 4096, 640
+        for B in (1, 8, 64):
+            with self.subTest(B=B):
+                q, kv, g = _qkv(B, S, 8, seed=B)
+                idx = _random_indices(B, topk, S, g)
+                sink = torch.randn(8, dtype=torch.float32, device="cuda", generator=g)
+                base = sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, attn_sink=sink)
+                one = sparse_mla_prefill(
+                    q, kv, idx, SM_SCALE, D_V, attn_sink=sink, splits=1
+                )
+                self.assertTrue(
+                    torch.equal(base, one), f"splits=1 diverged from default at B={B}"
+                )
+
+    def test_split_matches_unsplit(self):
+        # Splitting reassociates the softmax, so the difference is reduction
+        # order alone -- one bf16 ulp for outputs in [0.5, 1).
+        S, topk = 4096, 640
+        for B in (1, 8, 64):
+            for splits in (2, 4, 10):
+                with self.subTest(B=B, splits=splits):
+                    q, kv, g = _qkv(B, S, 8, seed=B + splits)
+                    idx = _random_indices(B, topk, S, g)
+                    sink = torch.randn(
+                        8, dtype=torch.float32, device="cuda", generator=g
+                    )
+                    ref = sparse_mla_prefill(
+                        q, kv, idx, SM_SCALE, D_V, attn_sink=sink
+                    )
+                    got = sparse_mla_prefill(
+                        q, kv, idx, SM_SCALE, D_V, attn_sink=sink, splits=splits
+                    )
+                    _assert_matches(
+                        self, got, ref, f"split B={B} S={splits}",
+                        cos_min=0.99999, max_abs=0.01,
+                    )
+
+    def test_split_auto_is_correct(self):
+        S, topk = 4096, 640
+        for B in (1, 16, 128):
+            with self.subTest(B=B):
+                q, kv, g = _qkv(B, S, 8, seed=B * 3)
+                idx = _random_indices(B, topk, S, g)
+                sink = torch.randn(8, dtype=torch.float32, device="cuda", generator=g)
+                _assert_matches(
+                    self,
+                    sparse_mla_prefill(
+                        q, kv, idx, SM_SCALE, D_V, attn_sink=sink, splits="auto"
+                    ),
+                    sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, attn_sink=sink),
+                    f"auto-split B={B}",
+                    cos_min=0.99999,
+                    max_abs=0.01,
+                )
+
+    def test_ragged_lengths_survive_splitting(self):
+        # A split that lands entirely past a row's valid length must contribute
+        # nothing rather than poisoning the merge with an empty softmax.
+        S, topk, B = 4096, 640, 32
+        q, kv, g = _qkv(B, S, 8, seed=99)
+        idx = _random_indices(B, topk, S, g, pad_frac=0.5)
+        sink = torch.randn(8, dtype=torch.float32, device="cuda", generator=g)
+        ref = sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, attn_sink=sink)
+        for splits in (2, 10):
+            with self.subTest(splits=splits):
+                _assert_matches(
+                    self,
+                    sparse_mla_prefill(
+                        q, kv, idx, SM_SCALE, D_V, attn_sink=sink, splits=splits
+                    ),
+                    ref,
+                    f"ragged split S={splits}",
+                    cos_min=0.99999,
+                    max_abs=0.01,
+                )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestNativePagedFP8(CustomTestCase):
+    """The gather that hands the stored fp8 to the tensor core unconverted."""
+
+    def _entry(self):
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            _has_fp8_mma,
+            sparse_mla_prefill_paged_fp8_native,
+        )
+
+        if not _has_fp8_mma():
+            self.skipTest("device has no native fp8 mma (sm_121 upcasts)")
+        return sparse_mla_prefill_paged_fp8_native
+
+    def test_matches_bf16_gather(self):
+        native = self._entry()
+        S, PAGE, T, topk = 2048, 256, 512, 640
+        pool, kv = _build_paged_fp8_pool(S, PAGE, seed=11)
+        for h in (8, 16):
+            with self.subTest(h=h):
+                g = torch.Generator(device="cuda").manual_seed(h)
+                q = torch.randn(
+                    T, h, 512, dtype=torch.bfloat16, device="cuda", generator=g
+                )
+                idx = _random_indices(T, topk, S, g)
+                sink = torch.randn(h, dtype=torch.float32, device="cuda", generator=g)
+                # Quantising Q is what this path costs; the KV side is exact, so
+                # the tolerance is looser than the bf16 gather's but bounded.
+                _assert_matches(
+                    self,
+                    native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink),
+                    sparse_mla_prefill(q, kv, idx, SM_SCALE, 512, attn_sink=sink),
+                    f"native paged fp8 h={h}",
+                    cos_min=0.999,
+                    max_abs=0.06,
+                )
+
+    def test_split_matches_unsplit(self):
+        native = self._entry()
+        S, PAGE, topk = 2048, 256, 640
+        pool, _ = _build_paged_fp8_pool(S, PAGE, seed=5)
+        for B in (1, 32):
+            for splits in (1, 4, 10):
+                with self.subTest(B=B, splits=splits):
+                    g = torch.Generator(device="cuda").manual_seed(B + splits)
+                    q = torch.randn(
+                        B, 8, 512, dtype=torch.bfloat16, device="cuda", generator=g
+                    )
+                    idx = _random_indices(B, topk, S, g)
+                    sink = torch.randn(
+                        8, dtype=torch.float32, device="cuda", generator=g
+                    )
+                    ref = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink)
+                    got = native(
+                        q, pool, idx, SM_SCALE, PAGE, attn_sink=sink, splits=splits
+                    )
+                    if splits == 1:
+                        self.assertTrue(
+                            torch.equal(ref, got),
+                            f"native splits=1 diverged at B={B}",
+                        )
+                    else:
+                        _assert_matches(
+                            self, got, ref, f"native split B={B} S={splits}",
+                            cos_min=0.99999, max_abs=0.01,
+                        )
+
+    def test_fp8_gate_excludes_sm121(self):
+        # sm_121 accepts fp8 operands but software-emulates them, so the gate is
+        # set membership rather than a >= comparison. _PINNED carries a (12, 1)
+        # entry, which is exactly the trap this guards.
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            _FP8_MMA_CAPS,
+        )
+
+        self.assertIn((12, 0), _FP8_MMA_CAPS)
+        self.assertNotIn((12, 1), _FP8_MMA_CAPS)
