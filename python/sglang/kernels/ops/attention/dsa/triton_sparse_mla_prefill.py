@@ -113,10 +113,22 @@ S=8192 pool rows:
 * **The gather is not the wall.** Stripping the attention math and timing the
   same gather alone gives 0.622 ms against the kernel's 1.488 ms (RTX 5080), so
   the gather is 42% of the runtime at 3.92 TiB/s out of L2 (the pool is 8 MiB
-  and fits). The kernel reaches 57.8 TFLOPS, ~26% of this part's bf16 tensor
-  peak, so it is neither bandwidth- nor math-bound — it is issue/latency-bound.
-  That is why reading fewer bytes cannot pay: even a free halving of the gather
-  bytes would cap out around 1.26x.
+  and fits). That is why reading fewer bytes cannot pay: even a free halving of
+  the gather bytes would cap out around 1.26x.
+* **Nsight Compute on the retuned kernel says the tensor pipe is.** Compute (SM)
+  throughput 70.38%, with Tensor the top pipeline at 70.4% ("well-utilized");
+  memory 52.30%, DRAM only 6.02%, L2 hit 96.89%, no register or shared-memory
+  spilling, and 31.6 of every 32 bytes per sector used. An earlier reading of
+  these timings as issue-bound was wrong — it compared against the wrong tensor
+  peak. Being tensor-bound is why removing padded mma rows (``_PINNED_NARROW_H``)
+  paid and why adding instructions to save bytes (the paged-fp8 gather) did not.
+* The remaining headroom NCU names is occupancy, not the pipes: theoretical
+  16.67% / achieved 16.48%, i.e. 2 blocks per SM, limited *simultaneously* by
+  registers and shared memory (Block Limit Registers = 2, Block Limit Shared Mem
+  = 2), with schedulers reporting "No Eligible" 68.96%. Its estimated speedup for
+  fixing occupancy is 29.6%. Both limits have to move together; the
+  ``[BLOCK_H, d_v]`` fp32 accumulator is the obvious target and is already half
+  what it was.
 * Building the kernel up in layers over the same gather splits the rest:
   gather 56%, QK dot + online softmax 6.7%, **PV accumulate 37%** (RTX 5090,
   T=4096, h=8, topk=640). The two dots are the same FLOP count, so the PV side
