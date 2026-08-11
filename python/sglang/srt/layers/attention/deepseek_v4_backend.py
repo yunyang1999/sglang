@@ -88,6 +88,12 @@ _is_sm120 = is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
+# Consume the sparse-prefill workspace with the Triton sparse-MLA kernel rather
+# than flash_mla_sparse_fwd. Read once, like the other module-level capability
+# flags, so the hot path does not re-read the environment per layer.
+_dsv4_triton_sparse_prefill = envs.SGLANG_DSV4_TRITON_SPARSE_PREFILL.get()
+_dsv4_triton_union = envs.SGLANG_DSV4_TRITON_UNION.get()
+
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
@@ -1730,13 +1736,20 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sparse_prefill_fwd does not support SM120.
+            # sparse_prefill_fwd does not support SM120 -- but the path itself
+            # does. Everything ahead of the kernel (the chunk cache, the flat
+            # bf16 workspace, the rebased indices) is architecture-neutral; only
+            # the final flash_mla_sparse_fwd call is gated. With the Triton
+            # sparse-MLA kernel selected, that call is replaced and SM120 can
+            # take the sparse-prefill route instead of falling through to the
+            # decode entry, which transcodes the entire page pool per layer.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and (not _is_sm120 or _dsv4_triton_sparse_prefill)
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                    or _dsv4_triton_sparse_prefill
                 )
             ):
                 return self._forward_prefill_sparse(
@@ -1804,7 +1817,7 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
     ) -> torch.Tensor:
-        """Unified prefill via flash_mla_sparse_fwd. Replaces the
+        """Unified prefill via a sparse-MLA kernel. Replaces the
         flash_mla_with_kvcache call on the extend path. Per request,
         positionally gathers the SWA window (always) and the compressed
         cache (c4/c128) into a flat bf16 workspace, then lets
@@ -1812,12 +1825,16 @@ class DeepseekV4AttnBackend(
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        if _is_xpu:
-            from sgl_kernel import flash_mla_sparse_fwd
-        else:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        # The import stays inside the branch that uses it: on SM120
+        # flash_mla_sparse_fwd is not built, so importing it unconditionally
+        # would break the Triton route this method also serves.
+        if not _dsv4_triton_sparse_prefill:
+            if _is_xpu:
+                from sgl_kernel import flash_mla_sparse_fwd
+            else:
+                from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
-        # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
+        # q is (b, 1, h_q, d_qk); both kernels take (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
         cache = self.forward_metadata.sparse_prefill_cache
@@ -1892,6 +1909,29 @@ class DeepseekV4AttnBackend(
             out=swa_slice,
         )
         kv = workspace
+
+        if _dsv4_triton_sparse_prefill:
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+                sparse_mla_prefill,
+            )
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_is_capture_mode,
+            )
+
+            # The union path sizes its scratch from the observed index range,
+            # which costs one device-to-host read and cannot be graph-captured.
+            # Fall back to the per-token path under capture: same result.
+            union = 0 if get_is_capture_mode() else _dsv4_triton_union
+            return sparse_mla_prefill(
+                q_flat,
+                kv,
+                combined_indices,
+                self.softmax_scale,
+                self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+                union=union,
+            )
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,

@@ -713,6 +713,18 @@ class Envs:
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # Route DeepSeek-V4's sparse prefill through the Triton sparse-MLA kernel
+    # instead of flash_mla_sparse_fwd. This is what opens the path on SM120,
+    # where flash_mla_sparse_fwd does not build and prefill otherwise falls
+    # through to the decode entry (which transcodes the whole page pool first).
+    # Off by default: on SM90/SM100 the CUDA kernel is the incumbent and this
+    # only changes which of the two consumes the same bf16 workspace.
+    SGLANG_DSV4_TRITON_SPARSE_PREFILL = EnvBool(False)
+    # Union group size for that path: 0 off, 2 or 4 make G adjacent query
+    # tokens share one gathered index set (exact; an ownership mask restores
+    # each token's own softmax). Measured on DeepSeek-V4's shape it only pays
+    # above ~0.75 neighbour retention, so it stays opt-in.
+    SGLANG_DSV4_TRITON_UNION = EnvInt(0)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
