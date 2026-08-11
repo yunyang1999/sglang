@@ -100,6 +100,7 @@ def _nsa_prefill_kernel(
     BLOCK_H: tl.constexpr,
     D_QK: tl.constexpr,
     D_V: tl.constexpr,
+    D_V_PAD: tl.constexpr,  # next power of two >= D_V; tl.arange needs one
     BLOCK_N: tl.constexpr,
     FP8: tl.constexpr,
     MATH_BF16: tl.constexpr,  # with FP8: cast tiles to bf16 after load (halve L1/L2
@@ -123,12 +124,19 @@ def _nsa_prefill_kernel(
 
     h = tl.arange(0, BLOCK_H)
     hmask = h < H
-    dv = tl.arange(0, D_V)
+    dv = tl.arange(0, D_V_PAD)
+    # DeepSeek-V4's value dim is 448, which tl.arange cannot express. Carry the
+    # tile at the next power of two and mask the surplus columns to zero so they
+    # contribute nothing to either dot; when D_V is already a power of two the
+    # mask is all-true and nothing changes.
+    vmask = dv < D_V
     dt = tl.arange(0, D_TAIL)
 
     qb = q_ptr + t * H * D_QK
     q_main = tl.load(
-        qb + h[:, None] * D_QK + dv[None, :], mask=hmask[:, None], other=0.0
+        qb + h[:, None] * D_QK + dv[None, :],
+        mask=hmask[:, None] & vmask[None, :],
+        other=0.0,
     )
     q_tail = tl.load(
         qb + h[:, None] * D_QK + (D_V + dt)[None, :], mask=hmask[:, None], other=0.0
@@ -139,7 +147,7 @@ def _nsa_prefill_kernel(
 
     m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_H], tl.float32)
-    acc = tl.zeros([BLOCK_H, D_V], tl.float32)
+    acc = tl.zeros([BLOCK_H, D_V_PAD], tl.float32)
 
     n = tl.arange(0, BLOCK_N)
     k_len = tl.load(len_ptr + t)
@@ -151,7 +159,9 @@ def _nsa_prefill_kernel(
         else:
             row = tl.where(valid, idx, 0)
         kb = kv_ptr + row[:, None] * D_QK
-        kv_main = tl.load(kb + dv[None, :], mask=valid[:, None], other=0.0)
+        kv_main = tl.load(
+            kb + dv[None, :], mask=valid[:, None] & vmask[None, :], other=0.0
+        )
         kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=valid[:, None], other=0.0)
         if FP8 and MATH_BF16:
             kv_main = kv_main.to(tl.bfloat16)
@@ -178,7 +188,7 @@ def _nsa_prefill_kernel(
     tl.store(
         o_ptr + t * H * D_V + h[:, None] * D_V + dv[None, :],
         acc.to(o_ptr.dtype.element_ty),
-        mask=hmask[:, None],
+        mask=hmask[:, None] & vmask[None, :],
     )
 
 
@@ -664,6 +674,15 @@ def sparse_mla_prefill(
         indices = indices.squeeze(1)
     T, h, d_qk = q.shape
     topk = indices.shape[-1]
+    if (union or dense) and (d_v & (d_v - 1)):
+        # The base path carries a padded value tile, but the union and
+        # dense-prefix kernels still index the value dim directly, so a
+        # non-power-of-two d_v (DeepSeek-V4: 448) would silently mis-tile there.
+        raise ValueError(
+            f"the union and dense-prefix fast paths need a power-of-two d_v; "
+            f"got {d_v}. Run the base path for this model."
+        )
+
     q, kv, indices = q.contiguous(), kv.contiguous(), indices.contiguous()
     if out is None:
         out = torch.empty(T, h, d_v, dtype=torch.bfloat16, device=q.device)
@@ -721,6 +740,7 @@ def sparse_mla_prefill(
                 BLOCK_H=block_h,
                 D_QK=d_qk,
                 D_V=d_v,
+                D_V_PAD=triton.next_power_of_2(d_v),
                 BLOCK_N=bn_try,
                 num_warps=warps,
                 num_stages=ns_try,

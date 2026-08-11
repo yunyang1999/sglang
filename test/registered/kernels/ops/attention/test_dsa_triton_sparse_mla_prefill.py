@@ -209,6 +209,26 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
         self.assertTrue(torch.equal(a, b), "int64 addressing changed the result")
         _assert_matches(self, b, _reference(q, kv, idx), "int64 indexing")
 
+    def test_non_power_of_two_value_dim(self):
+        # DeepSeek-V4 splits a 512-wide head into 448 value + 64 rope. tl.arange
+        # cannot express 448, so the base path carries the value tile at the next
+        # power of two and masks the surplus; the union and dense-prefix paths
+        # index the value dim directly and must refuse rather than mis-tile.
+        T, topk, S, d_qk, d_v = 512, 512, 1024, 512, 448
+        g = torch.Generator(device="cuda").manual_seed(71)
+        q = torch.randn(T, 8, d_qk, dtype=torch.bfloat16, device="cuda", generator=g)
+        kv = torch.randn(S, d_qk, dtype=torch.bfloat16, device="cuda", generator=g)
+        idx = _random_indices(T, topk, S, g)
+        _assert_matches(
+            self,
+            sparse_mla_prefill(q, kv, idx, SM_SCALE, d_v),
+            _reference(q, kv, idx, d_v),
+            "d_v=448 base path",
+        )
+        for kwargs in ({"union": 2}, {"dense": True}):
+            with self.assertRaisesRegex(ValueError, "power-of-two d_v"):
+                sparse_mla_prefill(q, kv, idx, SM_SCALE, d_v, **kwargs)
+
     def test_deterministic(self):
         # No split-K / atomics / partial merge, so repeated calls must be
         # bitwise identical -- the property that lets a served model be
