@@ -31,9 +31,13 @@ This kernel runs **one program per query token** with a ``BLOCK_H=16`` head tile
 registers, and reuses ``V`` as ``K[:, :d_v]`` (MLA latent) so the value rows are
 never gathered twice. No global partials, no merge pass.
 
-The ``BLOCK_H`` floor of 16 is deliberate: dropping it to the exact head count
-at H=8 produces bitwise-identical output but runs ~7% slower, because the
-narrower MMA does not pay for the register pressure it saves.
+The ``BLOCK_H`` floor was 16 on the grounds that dropping it to the exact head
+count at H=8 is bitwise-identical but ~7% slower. That holds only while the tile
+is held fixed: on SM120 the pair (``BLOCK_H`` 8, a narrower and deeper tile) is
+1.27-1.47x faster than (16, the wide tile), because halving the ``[BLOCK_H,
+d_v]`` fp32 accumulator is what buys the register budget for the deeper
+pipeline. See ``_PINNED_NARROW_H``. Architectures that have not been re-measured
+keep the 16-row floor.
 
 Interface matches ``sgl_kernel.flash_mla.flash_mla_sparse_fwd``::
 
@@ -106,6 +110,19 @@ S=8192 pool rows:
 * The fp8 -> bf16 dequant that feeds a gather is not worth removing: 0.0145 ms
   for the whole 8192-row pool, ~1% of the attention. See the paged-fp8 section
   below for the attempt and why it lost.
+* **The gather is not the wall.** Stripping the attention math and timing the
+  same gather alone gives 0.622 ms against the kernel's 1.488 ms (RTX 5080), so
+  the gather is 42% of the runtime at 3.92 TiB/s out of L2 (the pool is 8 MiB
+  and fits). The kernel reaches 57.8 TFLOPS, ~26% of this part's bf16 tensor
+  peak, so it is neither bandwidth- nor math-bound — it is issue/latency-bound.
+  That is why reading fewer bytes cannot pay: even a free halving of the gather
+  bytes would cap out around 1.26x.
+* Building the kernel up in layers over the same gather splits the rest:
+  gather 56%, QK dot + online softmax 6.7%, **PV accumulate 37%** (RTX 5090,
+  T=4096, h=8, topk=640). The two dots are the same FLOP count, so the PV side
+  is not paying for arithmetic — it is paying for the wide ``[BLOCK_H, d_v]``
+  fp32 accumulator it rescales and writes every iteration. Halving it is what
+  ``_PINNED_NARROW_H`` buys, and it is worth 1.27-1.47x.
 
 All tunables are explicit arguments — the module reads no environment
 variables. If a tuned tile exceeds the device shared-memory budget (e.g. a
@@ -705,9 +722,71 @@ def _topk_length(indices, topk):
 _UNTUNED_ARCH_WARNED = set()
 
 
-def _config(device):
+# A large head count changes which tile wins, so it gets its own entry rather
+# than riding the h<=32 one. Swept on SM120 at DSv4's shape (T=4096, topk=640):
+# at h=64 the pinned (64, 4, 2) runs 10.87 ms and (16, 8, 2) runs 9.29 ms, 1.17x;
+# at h<=32 the pinned tile is already the winner (h=32's best is 1.01x, inside
+# noise), so those are left alone. This matters for TP1/TP2, where 64/32 heads
+# are real, and for any caller that still pads its head count up.
+_PINNED_WIDE_H = {
+    (12, 0): (16, 8, 2),
+    (12, 1): (16, 8, 2),
+}
+_WIDE_H = 32  # head counts above this take the wide-H entry
+
+# A head count at or below this gets BLOCK_H = the head count instead of the
+# 16-row floor, together with its own tile. The two only pay together: at the
+# 16-row floor BLOCK_H changes nothing (1.00-1.02x), and at BLOCK_H 16 the wide
+# tile is still the winner -- it is the pair that moves.
+#
+# Why it pays here: with 8 heads the 16-row tile spends half its mma rows on
+# masked padding, and the fp32 accumulator it carries is [BLOCK_H, d_v] = 32 KB
+# of registers. Halving both frees enough register budget for a deeper pipeline
+# (num_stages 3) at a narrower BLOCK_N. That matters because the PV accumulate,
+# not the gather, is where the time goes: decomposing the kernel over the same
+# gather gives gather 56%, QK dot + online softmax 6.7%, PV accumulate 37%
+# (RTX 5090, T=4096, h=8, topk=640).
+#
+# Paired same-session A/B, (BLOCK_H 16 + pinned tile) vs (BLOCK_H 8 + this one),
+# RTX 5090, h=8:
+#     DSv4 512/512 topk 640   T=2048/4096/8192 -> 1.27x / 1.30x / 1.36x
+#     GLM  576/512 topk 2048  T=2048/4096/8192 -> 1.32x / 1.45x / 1.47x
+# sigma 0.4-13.7 us against gaps of 80-1800 us.
+#
+# This contradicts the older note that BLOCK_H 8 is ~7% slower. That note is kept
+# in spirit as the reason for the floor on architectures where it has not been
+# re-measured: only entries listed here lower it, so SM90 and any untuned device
+# keep exactly the previous behaviour.
+_PINNED_NARROW_H = {
+    (12, 0): (32, 4, 3),
+    (12, 1): (32, 4, 3),
+}
+_NARROW_H = 8  # head counts at or below this take the narrow-H entry
+
+
+def _narrow_h(device, num_heads):
+    """Whether this device+head count has a measured sub-16 BLOCK_H entry."""
+    return (
+        num_heads is not None
+        and num_heads <= _NARROW_H
+        and torch.cuda.get_device_capability(device) in _PINNED_NARROW_H
+    )
+
+
+def _block_h(device, num_heads):
+    """Rows of the head mma tile. 16 unless this device+head count was swept
+    below it -- an unswept arch must not silently change tile."""
+    floor = 8 if _narrow_h(device, num_heads) else 16
+    return max(floor, triton.next_power_of_2(num_heads))
+
+
+def _config(device, num_heads=None):
     """Per-arch tuned (BLOCK_N, num_warps, num_stages); see _PINNED."""
     cap = torch.cuda.get_device_capability(device)
+    if num_heads is not None and num_heads > _WIDE_H and cap in _PINNED_WIDE_H:
+        return _PINNED_WIDE_H[cap]
+    if _narrow_h(device, num_heads):
+        return _PINNED_NARROW_H[cap]
     if cap in _PINNED:
         return _PINNED[cap]
     if cap not in _UNTUNED_ARCH_WARNED:
@@ -763,6 +842,7 @@ def sparse_mla_prefill(
     union_config=None,
     dense_config=None,
     int64_indexing=None,
+    block_h=None,
 ):
     """Fused sparse-MLA prefill. Returns ``out`` ``[T, H, d_v]`` bf16.
 
@@ -856,7 +936,7 @@ def sparse_mla_prefill(
     q_in, kv_in = q, kv
     scales = torch.ones(2, dtype=torch.float32, device=q.device)
 
-    bn, warps, stages = config or _config(q.device)
+    bn, warps, stages = config or _config(q.device, h)
     # int32 gather addressing unless the pool could overflow int32 element offsets
     # (row*d_qk + d_qk-1 must fit in int32) — production pools can exceed this.
     # The threshold is ~3.7M rows at d_qk=576, which no test can allocate, so the
@@ -865,7 +945,7 @@ def sparse_mla_prefill(
         idx64 = kv.shape[0] > (2**31 - 1 - (d_qk - 1)) // d_qk
     else:
         idx64 = bool(int64_indexing)
-    block_h = max(16, triton.next_power_of_2(h))
+    block_h = block_h or _block_h(q.device, h)
     for bn_try, ns_try in _smem_fallbacks(bn, stages):
         try:
             _nsa_prefill_kernel[(T,)](
@@ -1256,8 +1336,8 @@ def sparse_mla_prefill_paged_fp8(
             raise ValueError(f"attn_sink must be [{h}]; got {tuple(attn_sink.shape)}.")
         attn_sink = attn_sink.to(torch.float32).contiguous()
 
-    bn, warps, stages = config or _config(q.device)
-    block_h = max(16, triton.next_power_of_2(h))
+    bn, warps, stages = config or _config(q.device, h)
+    block_h = _block_h(q.device, h)
     # The decode holds an fp32 staging tile alongside the bf16 one, so a tile the
     # bf16 path fits can miss the smem budget here; step down as it does.
     for bn_try, ns_try in _smem_fallbacks(bn, stages):
