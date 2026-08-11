@@ -94,6 +94,7 @@ def _nsa_prefill_kernel(
     len_ptr,
     o_ptr,
     scale_ptr,  # FP8 only: [s_qk = qs*ks, s_k = ks] fp32; unused when not FP8
+    sink_ptr,  # [H] fp32 learned per-head sink logit; unused when not HAS_SINK
     sm_scale,
     topk,
     H: tl.constexpr,
@@ -109,6 +110,8 @@ def _nsa_prefill_kernel(
     # int32*D_QK (rows > ~3.7M). int32 fast path: SASS drops
     # 36x IMAD.WIDE -> IMAD in the hot gather loop
     # (cuda-agent step-001, -97us z=8.11 @ T=8192).
+    HAS_SINK: tl.constexpr,  # DeepSeek-V4: a learned per-head logit joins the
+    # softmax denominator but contributes no value row.
 ):
     t = tl.program_id(0)
     D_TAIL: tl.constexpr = D_QK - D_V
@@ -130,7 +133,6 @@ def _nsa_prefill_kernel(
     # contribute nothing to either dot; when D_V is already a power of two the
     # mask is all-true and nothing changes.
     vmask = dv < D_V
-    dt = tl.arange(0, D_TAIL)
 
     qb = q_ptr + t * H * D_QK
     q_main = tl.load(
@@ -138,12 +140,19 @@ def _nsa_prefill_kernel(
         mask=hmask[:, None] & vmask[None, :],
         other=0.0,
     )
-    q_tail = tl.load(
-        qb + h[:, None] * D_QK + (D_V + dt)[None, :], mask=hmask[:, None], other=0.0
-    )
     if FP8 and MATH_BF16:
         q_main = q_main.to(tl.bfloat16)
-        q_tail = q_tail.to(tl.bfloat16)
+    # DeepSeek-V4 has no rope tail to carry separately: its 512-wide head is both
+    # the key and the whole value (the rope columns are un-rotated downstream, on
+    # the attention output), so D_QK == D_V and the second dot disappears.
+    # tl.arange(0, 0) is a compile error, so the tail must be elided, not masked.
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+        q_tail = tl.load(
+            qb + h[:, None] * D_QK + (D_V + dt)[None, :], mask=hmask[:, None], other=0.0
+        )
+        if FP8 and MATH_BF16:
+            q_tail = q_tail.to(tl.bfloat16)
 
     m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_H], tl.float32)
@@ -162,13 +171,16 @@ def _nsa_prefill_kernel(
         kv_main = tl.load(
             kb + dv[None, :], mask=valid[:, None] & vmask[None, :], other=0.0
         )
-        kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=valid[:, None], other=0.0)
         if FP8 and MATH_BF16:
             kv_main = kv_main.to(tl.bfloat16)
-            kv_tail = kv_tail.to(tl.bfloat16)
 
         qk = tl.dot(q_main, tl.trans(kv_main))
-        qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * qk_scale
+        if D_TAIL > 0:
+            kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=valid[:, None], other=0.0)
+            if FP8 and MATH_BF16:
+                kv_tail = kv_tail.to(tl.bfloat16)
+            qk = tl.dot(q_tail, tl.trans(kv_tail), qk)
+        qk = qk * qk_scale
         qk = tl.where(valid[None, :], qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -182,6 +194,20 @@ def _nsa_prefill_kernel(
             p_q = p.to(kv_main.dtype)
         acc = acc * alpha[:, None] + tl.dot(p_q, kv_main)
         m_i = m_new
+
+    if HAS_SINK:
+        # The sink is a raw logit (already in natural-log space, not scaled by
+        # sm_scale) that joins the denominator without contributing a value row,
+        # matching `_apply_attn_sink`'s logaddexp(lse, sink) in the SM120 decode
+        # path. `acc` and `l_i` are both held at base `m_base`, so rescaling the
+        # pair to a combined max leaves acc/l_i unchanged while keeping
+        # exp(sink - base) from overflowing when every logit is far below sink.
+        sink = tl.load(sink_ptr + h, mask=hmask, other=-float("inf")).to(tl.float32)
+        m_base = tl.where(m_i == -float("inf"), 0.0, m_i)
+        m_comb = tl.maximum(m_base, sink)
+        rescale = tl.exp(m_base - m_comb)
+        l_i = l_i * rescale + tl.exp(sink - m_comb)
+        acc = acc * rescale[:, None]
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     acc = acc * (out_scale / l_safe[:, None])
@@ -634,6 +660,7 @@ def sparse_mla_prefill(
     sm_scale,
     d_v=512,
     *,
+    attn_sink=None,
     topk_length=None,
     out=None,
     union=0,
@@ -652,7 +679,12 @@ def sparse_mla_prefill(
         indices: ``[T, topk]`` or ``[T, 1, topk]`` int32 selected slots; ``-1``
             or ``>= S`` marks an invalid slot and is skipped.
         sm_scale: softmax scale.
-        d_v: value head dim (512 for DSA).
+        d_v: value head dim (512 for DSA). ``d_qk == d_v`` is allowed and means
+            there is no rope tail to score separately — DeepSeek-V4's 512-wide
+            head is both the key and the whole value.
+        attn_sink: optional ``[H]`` fp32 learned per-head sink logit (DeepSeek-V4).
+            Joins the softmax denominator without contributing a value row, i.e.
+            ``logaddexp(lse, sink)``. Base path only.
         topk_length: optional ``[T]`` int32 per-row valid count. Computed from
             ``indices`` when omitted; pass it to skip that reduction.
         out: optional preallocated ``[T, H, d_v]`` bf16 output.
@@ -674,6 +706,28 @@ def sparse_mla_prefill(
         indices = indices.squeeze(1)
     T, h, d_qk = q.shape
     topk = indices.shape[-1]
+    if d_qk < d_v:
+        raise ValueError(f"d_v ({d_v}) cannot exceed the query width ({d_qk}).")
+    if (union or dense) and d_qk == d_v:
+        # Both fast-path kernels build the rope tail with tl.arange(0, d_qk - d_v);
+        # a zero-width tail is a compile error there, not a no-op.
+        raise ValueError(
+            "the union and dense-prefix fast paths need a non-empty rope tail "
+            f"(d_qk > d_v); got d_qk = d_v = {d_v}. Run the base path for this "
+            "model."
+        )
+    if (union or dense) and attn_sink is not None:
+        raise ValueError(
+            "attn_sink is implemented on the base path only; the union and "
+            "dense-prefix kernels would drop it silently."
+        )
+    if attn_sink is not None:
+        if attn_sink.shape != (h,):
+            raise ValueError(
+                f"attn_sink must be [num_heads] = [{h}]; got "
+                f"{tuple(attn_sink.shape)}."
+            )
+        attn_sink = attn_sink.to(torch.float32).contiguous()
     if (union or dense) and (d_v & (d_v - 1)):
         # The base path carries a padded value tile, but the union and
         # dense-prefix kernels still index the value dim directly, so a
@@ -698,6 +752,7 @@ def sparse_mla_prefill(
                 indices[P:],
                 sm_scale,
                 d_v,
+                attn_sink=attn_sink,
                 out=out[P:],
                 union=union,
                 dense=False,
@@ -734,6 +789,9 @@ def sparse_mla_prefill(
                 topk_length,
                 out,
                 scales,
+                # `scales` doubles as an unread placeholder so the pointer arg is
+                # always a real tensor; HAS_SINK gates every load from it.
+                attn_sink if attn_sink is not None else scales,
                 sm_scale,
                 topk,
                 H=h,
@@ -747,6 +805,7 @@ def sparse_mla_prefill(
                 FP8=False,
                 MATH_BF16=False,
                 IDX64=idx64,
+                HAS_SINK=attn_sink is not None,
             )
             return out
         except triton.runtime.errors.OutOfResources:
