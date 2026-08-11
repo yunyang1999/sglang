@@ -293,6 +293,56 @@ candidates that follow from them:
   only 8 head rows. The profile's floor for this algorithm is ~0.59 ms, 1.9x
   today, reachable only by sharing the gather.
 
+``union``: the retention question, answered from the real model
+----------------------------------------------------------------
+``union``'s payoff was gated on one number nobody had measured -- how much of
+its selection a query token inherits from its predecessor. Captured from
+DeepSeek-V4-Flash itself (8xH200, TP8, two real 16384-token prompts, all 43
+layers, 176 index tensors), rather than modelled:
+
+    positions      selection density   retention   union ratio at G=4
+    0 - 2k         >= 1.0 (no choice)     1.000          1.01
+    3k - 4k            0.50               0.85           1.18-1.23
+    7k - 8k            0.25               0.81-0.85      1.27-1.39
+    11k - 12k          0.17               0.68-0.76      1.47-1.59
+    15k - 16k          0.12               0.57-0.73      1.42-1.80
+
+Against the payoff curve measured here (0.50 -> 0.84x, 0.75 -> 1.06x,
+0.90 -> 1.25x), that lands as:
+
+* **positions 2k-8k: union G=4 wins, ~1.16-1.20x.**
+* **positions 8k-16k: break-even.**
+* **mid-network layers (L16-L34) past 15k: retention 0.46-0.57, union loses.**
+
+And the direction is the problem. Retention tracks selection density, which
+falls as context grows; DeepSeek-V4 advertises 1M context, so a fixed ``G=4``
+gets *worse* with longer sequences, not better. It must not be enabled globally.
+``G=2`` stays inside 1.12-1.28 union ratio everywhere measured -- but this
+kernel's own G=2 timings only reach break-even at retention 0.90, so it is safe
+without being profitable. The honest position: union is a shallow-context,
+early/late-layer optimisation on this model, and there is no fixed G that is
+right for a whole forward.
+
+Two structural facts from the same capture, worth having:
+
+* **There is no single [T, 640] index tensor.** The kernel is handed
+  ``indices`` [T, 128] into the sliding-window pool and
+  ``extra_indices_in_kvcache`` [T, 512] into the 4x-compressed C4 pool -- two
+  address spaces. 640 is the total gather width, not one set. Only the 21 C4
+  layers carry a selection at all; 20 C128 layers get a deterministic dense
+  enumeration (retention exactly 1.000) and 2 layers are sliding-window only.
+* The sliding window is exactly a shift-by-one: ``swa[t+1, j+1] == swa[t, j]``
+  held on 1,032,256 of 1,032,256 valid pairs. Unioning that half is nearly free
+  (1.023 at G=4) and dilutes the C4 cost by about 20%. No row names a KV
+  position twice, in either set, anywhere in the capture.
+
+An operational limit found the same way, unrelated to this kernel but worth
+recording: DSv4 attention allocates ``sizeof(int) * (batch*5+1)`` of dynamic
+shared memory for its scheduling metadata, and prefill puts one row per query
+token, so it hard-caps at about **11,622 query tokens per forward** against
+Hopper's 227 KB. Any ``chunked_prefill_size`` above ~11.6k fails with an
+``invalid argument`` from ``cudaFuncSetAttribute``.
+
 So the base path is at its ceiling on this shape, and ``union`` remains the only
 lever — gated not on tuning but on the trained indexer's neighbour retention,
 which needs a real capture to measure. ``G=2`` is not a shortcut to it: despite
