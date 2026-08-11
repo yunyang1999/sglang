@@ -94,6 +94,59 @@ T=4096, h=8, d_qk=d_v=512, combined topk=640):
   0.98x at 4096, 0.99x at 8192. Leave it off for DSv4; the exact-set guard makes
   enabling it harmless but pointless.
 
+What it is actually faster than, on DeepSeek-V4 / SM120
+--------------------------------------------------------
+An earlier revision of this note quoted a very large speedup against
+``flash_mla_sparse_decode_triton``. That number was against the wrong kernel and
+is withdrawn. ``environ.py`` sets ``SGLANG_SM120_FLASHMLA_BACKEND`` to
+``"flashinfer"``, and ``flash_mla_sm120.py`` describes the other values as
+forcing a fallback, so a stock SM120 deployment runs **FlashInfer's**
+``_sparse_mla_sm120`` (available from flashinfer-python 0.6.14; SGLang imports it
+without a try/except, so an older FlashInfer raises rather than falling back).
+
+The production call also does not have the shape this kernel takes. SGLang
+passes the sliding window (topk 128) as ``indices`` and the indexer selection
+(topk 512) as ``extra_indices`` -- two pools, never concatenated -- while this
+kernel takes the single combined 640 over the one flat workspace
+``_forward_prefill_sparse`` builds.
+
+And FlashInfer's SM120 prefill dispatches from a fixed table. Probing 70
+(heads, topk) pairs through SGLang's own ``_flash_mla_flashinfer``, exactly 16
+are accepted:
+
+    heads in {16, 32, 64, 128}  x  topk in {128, 512, 1024, 2048}
+
+DeepSeek-V4 after TP8 has **8** heads and a combined topk of **640**, so its real
+shape misses that set on both axes. That is what ``models/deepseek_v4.py``'s
+``padded_num_heads = 64 if n_local_heads <= 64 else n_heads`` is for: the padding
+is not a tuning choice, it is the only way to make the call legal.
+
+Measured that way -- FlashInfer in production form (8 real heads padded to 64,
+swa 128 + extra 512, page-split included) against this kernel with 8 real heads,
+RTX 5080:
+
+    B      A: flashinfer   C: ours paged fp8   D: ours bf16 + dequant   A/C    A/D
+    128       0.248 ms          0.323 ms            0.051 + 0.023        0.77x  3.38x
+    1024      1.707 ms          2.083 ms            0.308 + 0.022        0.82x  5.18x
+    8192     13.323 ms         15.792 ms            2.371 + 0.022        0.84x  5.57x
+
+Two honest readings, and they point opposite ways:
+
+* **On the same paged fp8 pool this kernel loses**, 0.77-0.84x. FlashInfer's
+  hand-written CUDA reads that layout better than the Triton gather does, and it
+  wins even while doing 8x the head work. The paged-fp8 entry here is not
+  competitive and should not be presented as if it were.
+* **On the flat bf16 workspace it wins 3.4-5.6x**, dequant charged in. But that
+  is a claim about the *route*, not the kernel: it says the sparse-prefill path
+  (dequantize once, gather bf16, no page transcode, no head padding) beats the
+  decode-entry path on SM120 -- which is what enabling
+  ``SGLANG_DSV4_TRITON_SPARSE_PREFILL`` does.
+
+For scale, FlashInfer's own head-padding tax is visible in the same run: 8 real
+heads padded to 64 costs **2.5-3.1x** the same work at its narrowest
+instantiation (16). Removing that tax is this kernel's whole structural
+advantage, and it is worth roughly what the padding costs -- not more.
+
 What this replaces on DeepSeek-V4 / SM120
 -----------------------------------------
 SM120 does not run the sparse-prefill path at all: `_forward_prefill_sparse` is
@@ -197,6 +250,38 @@ topk 640, h=8), T=4096 unless stated:
   (G, BLOCK_N, warps, stages) combinations the shipping ``G=4 (32,4,2)`` is
   optimal at every retention where union pays at all: 1.070x at 0.75 and 1.247x
   at 0.90. The wider mma tile is worth more than the extra block.
+
+Nsight Compute adds two facts the sweep could not see, and closes two more
+candidates that follow from them:
+
+* **``num_stages`` was inert.** The compiled TTGIR allocates
+  ``memdesc<1x32x512xbf16>`` for the KV tile -- stage depth 1 -- because the
+  gather address depends on the index load, so Triton's pipeliner cannot
+  prefetch across it. The whole 96-config sweep therefore explored a ``stages``
+  axis that did nothing. The cost is visible: the hottest single instruction in
+  the kernel is ``BAR.SYNC.DEFER_BLOCKING``, 98% of its samples in
+  ``long_scoreboard``, 5.15% of all samples.
+  Breaking the dependency by hand (load iteration k+1's indices before consuming
+  k's) does make Triton double-buffer -- and that is exactly why it loses:
+  shared memory goes 41728 -> 74240 B, which is 1 block per SM instead of 2.
+  Measured 0.74-0.81x at T=2048/4096/8192, bitwise-identical output. The second
+  block is worth more than the pipelining.
+* **The redundant half of the KV load mask is not free to remove either.**
+  ``valid[:, None]`` is provably redundant (``row`` is clamped, and ``qk`` is
+  forced to -inf on those columns so ``p`` is exactly zero), and line 237 spends
+  ~48% of its samples on integer/predicate work. Dropping it measured 0.95x --
+  slower, bitwise-identical. Recorded so it is not retried.
+* Register pressure is 183/thread, of which 64 are the ``acc`` fragment and 32
+  of those 64 are pure M-padding (16 HMMA accumulator destinations, 64 matching
+  ``FMUL``s for ``acc * alpha``). Recovering *all* of them would still buy zero
+  blocks: ``launch__occupancy_limit_registers`` and
+  ``launch__occupancy_limit_shared_mem`` are both 2, and 32768 of the 41728
+  shared bytes are one BLOCK_N=32 KV tile. ``maxnreg`` is not a lever here.
+* The tensor pipe issues **85.90 GFLOP against 42.95 GFLOP required -- exactly
+  2.00x** -- at 70.4% utilisation, with L2 behind it at 52.3%. Both numbers come
+  from the same fact: each query token amortises its own 640-row gather over
+  only 8 head rows. The profile's floor for this algorithm is ~0.59 ms, 1.9x
+  today, reachable only by sharing the gather.
 
 So the base path is at its ceiling on this shape, and ``union`` remains the only
 lever — gated not on tuning but on the trained indexer's neighbour retention,
