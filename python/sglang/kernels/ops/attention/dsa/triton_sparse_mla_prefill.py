@@ -143,6 +143,34 @@ Three things this says that the eager numbers hid:
   and still loses above B=4.** Splitting hides the gather deficit at small
   batch; it does not fix it. That deficit is the remaining work.
 
+Split-K over the *native* paged-fp8 gather closes the last gap. The table above
+used the old converting gather; re-driven by the native one, in the same run:
+
+    B    fi h=8   native unsplit   native split-K   S    fi/split   cos
+    1    0.0205      0.0430           0.0103       10      2.00x   0.9995876
+    8    0.0205      0.0430           0.0102       10      2.00x   0.9996073
+    16   0.0250      0.0430           0.0123       10      2.03x   0.9995874
+    32   0.0392      0.0431           0.0184        5      2.13x   0.9995892
+    64   0.0611      0.0445           0.0348        2      1.75x   0.9996021
+
+**There is no crossover.** The old gather's arm, measured beside it, falls under
+1.0x between B=4 and B=8 (1.43x, 1.32x, 1.26x, 0.81x, 0.53x, 0.43x, 0.39x); the
+native one holds 1.75-2.13x everywhere FlashInfer runs at all. fp8 decode is now
+within 25% of bf16 at B <= 8 and identical at B=16 (0.0123 both), against 3-5x
+behind before. The split kernel keeps the fp8 tensor core: 112x
+``mma.sync.aligned.m16n8k32...e4m3.e4m3.f32`` plus 32 bf16 for the rope dots,
+48384 B shared, against the old gather's 0 fp8 mma and 90368 B.
+
+Two integration facts that will bite whoever ships this:
+
+* **``_config``'s pinned ``h <= 8`` tile (32,4,3) is the bf16 kernel's tile and
+  costs the native fp8 path 1.48x** (0.0635 against 0.0430 ms unsplit). The fp8
+  arm needs its own (64,4,2) with BLOCK_H 8; it must not inherit ``_config``.
+* The split heuristic's ``_MAX_WAVES`` does **not** carry over from the old
+  gather: 4 -> 1. A gather ~6x cheaper makes a split's fixed cost relatively
+  larger, so programs stop paying a wave earlier. ``_MIN_CHUNKS_FP8`` does carry
+  over at 1, steeply (2 costs 1.14x, 4 costs 1.80x).
+
 Split-path accuracy: cos >= 0.9999956 at every (B, S) measured, max_abs 0.00195
 = exactly one bf16 ULP for outputs in [0.5, 1), i.e. it differs from the unsplit
 reference by at most the output format's own quantum. fp32 partials move cos to
