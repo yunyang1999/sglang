@@ -221,10 +221,11 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
         _assert_matches(self, b, _reference(q, kv, idx), "int64 indexing")
 
     def test_non_power_of_two_value_dim(self):
-        # DeepSeek-V4 splits a 512-wide head into 448 value + 64 rope. tl.arange
-        # cannot express 448, so the base path carries the value tile at the next
-        # power of two and masks the surplus; the union and dense-prefix paths
-        # index the value dim directly and must refuse rather than mis-tile.
+        # tl.arange cannot express 448, so the base path carries the value tile at
+        # the next power of two and masks the surplus; the union and dense-prefix
+        # paths index the value dim directly and must refuse rather than mis-tile.
+        # (This is spare capacity, not DeepSeek-V4: sglang derives d_v = head_dim
+        # = 512 for DSv4, which `test_no_rope_tail` covers instead.)
         T, topk, S, d_qk, d_v = 512, 512, 1024, 512, 448
         g = torch.Generator(device="cuda").manual_seed(71)
         q = torch.randn(T, 8, d_qk, dtype=torch.bfloat16, device="cuda", generator=g)

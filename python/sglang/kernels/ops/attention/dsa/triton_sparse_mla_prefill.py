@@ -128,10 +128,10 @@ def _nsa_prefill_kernel(
     h = tl.arange(0, BLOCK_H)
     hmask = h < H
     dv = tl.arange(0, D_V_PAD)
-    # DeepSeek-V4's value dim is 448, which tl.arange cannot express. Carry the
-    # tile at the next power of two and mask the surplus columns to zero so they
-    # contribute nothing to either dot; when D_V is already a power of two the
-    # mask is all-true and nothing changes.
+    # tl.arange cannot express a non-power-of-two value dim, so carry the tile at
+    # the next power of two and mask the surplus columns to zero: they then
+    # contribute nothing to either dot. When D_V is already a power of two the
+    # mask is all-true and the generated code is unchanged.
     vmask = dv < D_V
 
     qb = q_ptr + t * H * D_QK
@@ -731,7 +731,10 @@ def sparse_mla_prefill(
     if (union or dense) and (d_v & (d_v - 1)):
         # The base path carries a padded value tile, but the union and
         # dense-prefix kernels still index the value dim directly, so a
-        # non-power-of-two d_v (DeepSeek-V4: 448) would silently mis-tile there.
+        # non-power-of-two d_v would silently mis-tile there. (DeepSeek-V4 is not
+        # such a model: sglang hands it d_v = head_dim = 512 -- see the zero-tail
+        # guard above -- so the 448 case is a spare-capacity path, not the DSv4
+        # one.)
         raise ValueError(
             f"the union and dense-prefix fast paths need a power-of-two d_v; "
             f"got {d_v}. Run the base path for this model."
