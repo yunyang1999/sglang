@@ -361,16 +361,43 @@ turned on.
 Decode
 ------
 Nothing here is prefill-only: there is no causal structure and, on the base
-path, no cross-token sharing, so a decode step is simply ``T = batch``. It works
-and it is the faster of the two available kernels — 0.0324 ms at batch 1 against
-SGLang's SM120 ``flash_mla_sparse_decode_triton`` at 0.211 ms — but the design
-is the wrong shape for small-batch decode and the numbers say so: one program
-per query token means batch 1 lights up 1 of 84 SMs, and the wall time is flat
-at ~0.033 ms from batch 1 to 64 (32.4 us/token down to 0.53), only reaching its
-0.267 us/token floor at batch >= 2048. Filling the device at small batch needs
-splitting one token's top-k across CTAs and merging — exactly the partials-and-
-merge structure this kernel exists to avoid. Use it for decode because it wins
-today, not because the shape suits it.
+path, no cross-token sharing, so a decode step is simply ``T = batch``.
+
+Against FlashInfer at the same head count — its *decode* dispatch does have
+heads=8 (``_DECODE_DSV4_DISPATCH`` contains (8,128), (8,512), (8,1024)), unlike
+its prefill — swa 128 + c4 512, RTX 5080:
+
+    B    FlashInfer h=64   FlashInfer h=8   ours paged fp8   ours bf16
+    1        0.1234 ms        0.1239 ms       0.1683 ms      0.0386 ms
+    16       0.1246           0.1212          0.1687         0.0389
+    32       0.1224           0.1226          0.1688         0.0390
+    64       0.3525           0.1240          0.1695         0.0405
+
+Three things follow, and the third is the one that matters:
+
+* **SGLang's head padding is free below batch 64 and expensive at it.**
+  ``models/deepseek_v4.py`` pads 8 -> 64 under ``if attn_tp_size > 1:``, with no
+  architecture and no prefill/decode condition. At B <= 32 that costs nothing
+  (1.00-1.03x) because the regime is latency-bound; at B = 64 it costs **2.84x**.
+* **On bf16 this kernel is 3.06-3.28x faster than FlashInfer at heads=8**, flat
+  across the whole decode range.
+* **On paged fp8 it is 0.72-0.77x — it loses.** And decode has no flat bf16
+  workspace: ``_forward_prefill_sparse`` builds one, the decode path does not.
+  So the honest decode number today is the losing one, and the 3.2x is on a
+  layout decode would first have to be given.
+
+That makes the paged-fp8 gather — not the tile, not ``union`` — the thing worth
+fixing. It is the same deficit on both stages (0.83x at prefill B=8192, 0.72x at
+decode) and it is what stands between the bf16 results and the layout the KV
+cache actually stores.
+
+Separately, the design is still the wrong shape for small-batch decode and the
+numbers show it: one program per query token means batch 1 lights up 1 of 84
+SMs, and wall time is flat at ~0.039 ms from batch 1 to 64. Filling the device
+there needs splitting one token's top-k across CTAs and merging — exactly the
+partials-and-merge structure this kernel exists to avoid. It wins at these sizes
+anyway because everything in the regime is latency-bound, not because the shape
+suits it.
 
 All tunables are explicit arguments — the module reads no environment
 variables. If a tuned tile exceeds the device shared-memory budget (e.g. a
