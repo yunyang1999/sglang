@@ -94,6 +94,30 @@ T=4096, h=8, d_qk=d_v=512, combined topk=640):
   0.98x at 4096, 0.99x at 8192. Leave it off for DSv4; the exact-set guard makes
   enabling it harmless but pointless.
 
+What this replaces on DeepSeek-V4 / SM120
+-----------------------------------------
+SM120 does not run the sparse-prefill path at all: `_forward_prefill_sparse` is
+gated off (`deepseek_v4_backend.py`, "sparse_prefill_fwd does not support
+SM120"), so prefill goes through `flash_mla_with_kvcache_sm120`, whose first act
+is `_split_kv_pages_to_64` — a pure layout transcode from SGLang's page_size 256
+pool into the page_block_size 64 that FlashInfer's DSv4 entry requires. Zero
+math, paid per layer per forward.
+
+A gather addresses tokens directly (`page = tok // page_size`), so this kernel
+does not need it. Measured on RTX 5080 at DSv4's shape (topk 640, h=8, 8192-row
+pool), per layer:
+
+    T      page split alone   dequant + this kernel   ratio
+    512        0.222 ms             0.177 ms          1.25x
+    2048       0.856 ms             0.556 ms          1.54x
+    8192       3.398 ms             2.137 ms          1.59x
+
+The comparison is deliberately lopsided in the baseline's favour: the left
+column is only the transcode, with its attention kernel still to come, while the
+right column is the whole path. Even if that attention were free, routing prefill
+here is 1.59x at 8192 tokens — and the transcode is per layer, so at 43 layers it
+is ~146 ms of pure copying per 8192-token forward.
+
 Where the time actually goes on DeepSeek-V4 / SM120
 ---------------------------------------------------
 Measured on RTX 5080 (sm_120, torch 2.11+cu130 / triton 3.6), T=4096, topk=640,
@@ -135,6 +159,73 @@ S=8192 pool rows:
   is not paying for arithmetic — it is paying for the wide ``[BLOCK_H, d_v]``
   fp32 accumulator it rescales and writes every iteration. Halving it is what
   ``_PINNED_NARROW_H`` buys, and it is worth 1.27-1.47x.
+
+What is *not* left on the table (measured, so it need not be re-derived)
+-----------------------------------------------------------------------
+Nsight Compute puts the remaining headroom at occupancy — 2 blocks per SM,
+limited simultaneously by registers and shared memory, estimated speedup 29.6%.
+Four attempts to collect it all failed, each for a reason that is a property of
+the shape rather than of the tuning. RTX 5080, DSv4 shape (d_qk=d_v=512,
+topk 640, h=8), T=4096 unless stated:
+
+* **The base-path tile is at its global optimum.** All 96 combinations of
+  ``BLOCK_H`` {8,16} x ``BLOCK_N`` {16,32,64,128} x warps {2,4,8} x stages
+  {1,2,3,4} were timed: the shipping ``BLOCK_H=8 (32,4,3)`` wins at 1.186 ms,
+  ahead of ``(32,4,4)`` 1.198 and ``(16,2,2)`` 1.354. Nothing in the tile space
+  buys the 29.6%.
+* **The mma padding at h=8 cannot be removed without sharing the gather.**
+  Eight real head rows sit in a 16-row mma tile, so half the tensor rows are
+  padding, and transposing the dots does not help: it moves the pad from M to N,
+  which Triton widens to 16 as well. Packing two tokens without sharing their
+  index sets is also neutral — the combined dot is twice the size with the same
+  useful fraction. Sharing the gather is the only lever, i.e. ``union``.
+* **The gather does not become the wall at production pool sizes.** Every other
+  measurement here used an 8 MiB pool that fits in this device's 64 MiB L2 (NCU
+  confirmed, L2 hit 96.89%), so the obvious worry is that the ranking inverts
+  once the pool leaves cache. It does not: sweeping the pool from 8 MiB to
+  2 GiB at T=2048 costs only 1.31x (0.570 -> 0.747 ms, effective 2193 -> 1674
+  GiB/s). DSA's own locality is why — the sliding-window half shifts one
+  position per token, so consecutive tokens re-read almost all of it.
+* **``union``'s break-even is not overhead, and not occupancy either.** The
+  mark and compact launches together are 4-7% of union's runtime at retention
+  >= 0.5 (0.008-0.020 ms and 0.038-0.067 ms against ~1.1-1.3 ms), so fusing
+  them cannot move break-even. Occupancy looked more promising — the union
+  kernel takes 84.7/67.8 KB of shared memory against the base path's 40.8 KB,
+  i.e. 1 block per SM against 2 — but forcing it under half the budget makes it
+  *slower*: at retention 0.50 the configs that reach 3 blocks/SM (33.4 KB) run
+  0.86-0.88x base, behind the 1-block/SM ``(64,4,2)`` at 0.896x. Across 162
+  (G, BLOCK_N, warps, stages) combinations the shipping ``G=4 (32,4,2)`` is
+  optimal at every retention where union pays at all: 1.070x at 0.75 and 1.247x
+  at 0.90. The wider mma tile is worth more than the extra block.
+
+So the base path is at its ceiling on this shape, and ``union`` remains the only
+lever — gated not on tuning but on the trained indexer's neighbour retention,
+which needs a real capture to measure. ``G=2`` is not a shortcut to it: despite
+``G*H = 16`` filling the mma tile exactly at h=8, it loses at every retention
+below 0.90 (0.68x at 0.00, 0.86x at 0.50, 1.045x at 0.97) because two tokens
+amortise the union's fixed work half as well as four.
+
+One anomaly is recorded rather than explained: at retention 0.25 the union
+*launcher* (not its kernels) cost 6.2 ms, 83% of the call, for both G=2 and
+G=4, against 0.06-0.08 ms at every higher retention. It sits in the host-synced
+``amin``/``amax`` plus workspace management, not in the three Triton launches,
+which were timed separately and were normal. ``union`` is opt-in and off by
+default, so this is not on any shipped path, but it wants a look before it is
+turned on.
+
+Decode
+------
+Nothing here is prefill-only: there is no causal structure and, on the base
+path, no cross-token sharing, so a decode step is simply ``T = batch``. It works
+and it is the faster of the two available kernels — 0.0324 ms at batch 1 against
+SGLang's SM120 ``flash_mla_sparse_decode_triton`` at 0.211 ms — but the design
+is the wrong shape for small-batch decode and the numbers say so: one program
+per query token means batch 1 lights up 1 of 84 SMs, and the wall time is flat
+at ~0.033 ms from batch 1 to 64 (32.4 us/token down to 0.53), only reaching its
+0.267 us/token floor at batch >= 2048. Filling the device at small batch needs
+splitting one token's top-k across CTAs and merging — exactly the partials-and-
+merge structure this kernel exists to avoid. Use it for decode because it wins
+today, not because the shape suits it.
 
 All tunables are explicit arguments — the module reads no environment
 variables. If a tuned tile exceeds the device shared-memory budget (e.g. a
