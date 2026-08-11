@@ -93,6 +93,12 @@ _is_xpu = is_xpu()
 # flags, so the hot path does not re-read the environment per layer.
 _dsv4_triton_sparse_prefill = envs.SGLANG_DSV4_TRITON_SPARSE_PREFILL.get()
 _dsv4_triton_union = envs.SGLANG_DSV4_TRITON_UNION.get()
+# Route DeepSeek-V4 decode through the same kernel, reading the paged fp8 pools
+# natively. Separate from the prefill switch because the two land independently:
+# prefill has a dequantised workspace to consume, decode does not.
+_dsv4_triton_decode = envs.SGLANG_DSV4_TRITON_DECODE.get()
+# 0 lets the kernel pick host-side from batch, head count and candidate count.
+_DSV4_TRITON_DECODE_SPLITS = envs.SGLANG_DSV4_TRITON_DECODE_SPLITS.get()
 
 logger = logging.getLogger(__name__)
 
@@ -1762,7 +1768,40 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if _is_sm120 and _dsv4_triton_decode:
+                # The Triton sparse-MLA kernel reads the two paged fp8 pools
+                # directly, so decode needs no dequantised workspace and no head
+                # padding. Split-K fills the device at small batch, where one
+                # program per query token would otherwise leave 1 SM of 84 busy.
+                from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+                    sparse_mla_prefill_paged_fp8_native,
+                )
+
+                q3 = q.squeeze(1) if q.ndim == 4 else q
+                sink = attn_sink
+                if sink is not None and sink.shape[0] != q3.shape[1]:
+                    sink = sink[: q3.shape[1]].contiguous()
+                o = sparse_mla_prefill_paged_fp8_native(
+                    q3,
+                    swa_k_cache,
+                    swa_page_indices,
+                    self.softmax_scale,
+                    swa_window_size,
+                    extra_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_page_size=(
+                        page_sizes[compress_ratio]
+                        if extra_k_cache is not None
+                        else None
+                    ),
+                    extra_topk_length=extra_topk_lengths,
+                    attn_sink=sink,
+                    topk_length=swa_topk_lengths,
+                    # 0 is the config's "choose for me"; the kernel's
+                    # sentinel for that is the string "auto".
+                    splits=_DSV4_TRITON_DECODE_SPLITS or "auto",
+                ).unsqueeze(1)
+            elif _is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )

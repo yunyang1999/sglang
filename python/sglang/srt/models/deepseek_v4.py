@@ -210,6 +210,7 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 # does not need padding: it pads into a 16-row mma tile rather than into the
 # grid. Read once, like the other capability flags.
 _DSV4_TRITON_SPARSE_PREFILL = envs.SGLANG_DSV4_TRITON_SPARSE_PREFILL.get()
+_DSV4_TRITON_DECODE = envs.SGLANG_DSV4_TRITON_DECODE.get()
 
 
 def _dsv4_padded_heads(n_local_heads: int, n_heads: int, unpadded: bool) -> int:
@@ -1300,9 +1301,14 @@ class MQALayer(MqaAttentionBase):
             # Only the sparse-prefill route hands q to the Triton kernel; the
             # backend gate for it is the same `is_extend_without_speculative()`
             # once SGLANG_DSV4_TRITON_SPARSE_PREFILL is set.
+            # Decode is safe to unpad only when the Triton kernel serves it
+            # too: otherwise a decode batch above FlashInfer's
+            # _DECODE_MAX_TOKENS falls through to its prefill entry, which has
+            # no heads=8 instantiation and would raise.
+            extend = forward_batch.forward_mode.is_extend_without_speculative()
             unpadded_heads = (
-                _DSV4_TRITON_SPARSE_PREFILL
-                and forward_batch.forward_mode.is_extend_without_speculative()
+                (_DSV4_TRITON_SPARSE_PREFILL and extend)
+                or (_DSV4_TRITON_DECODE and not extend)
             )
             padded_num_heads = _dsv4_padded_heads(
                 self.n_local_heads, self.n_heads, unpadded_heads
