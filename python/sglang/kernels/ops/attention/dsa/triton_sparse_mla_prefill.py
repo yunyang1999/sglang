@@ -121,15 +121,30 @@ shape misses that set on both axes. That is what ``models/deepseek_v4.py``'s
 ``padded_num_heads = 64 if n_local_heads <= 64 else n_heads`` is for: the padding
 is not a tuning choice, it is the only way to make the call legal.
 
-Worth knowing before anyone optimises around this: the gap is in the *dispatch
-table*, not in FlashInfer's kernel. Its own prefill source
-(``csrc/sparse_mla_sm120_prefill.cu``) documents ``NUM_HEADS: 8, 16, 64, 128``
-with "NUM_HEADS < HPB=16 zero-pads + gates". So the kernel handles 8; the
-released Python entry refuses it -- re-checked on the dual-cache DSv4 path with
-the extra pool at the required 584 B/token, in case the single-cache probe had
-simply missed the DSv4 route, and it refuses there too. An upstream instantiation
-for heads=8 would delete SGLang's pad-to-64 outright, which is worth more to
-DeepSeek-V4 on SM120 than anything in this file.
+Where the gap actually is, and what it is worth -- this corrects an earlier
+version of this note, which claimed an upstream heads=8 instantiation would be
+worth more than anything in this file. It would not.
+
+The refusal is real and was re-checked on the dual-cache DSv4 path with the
+extra pool at the required 584 B/token. Its cause is specific: DSv4 shapes go to
+the *multi-group* kernel, and ``prefill_kernel.cuh`` hard-asserts
+``NUM_HEADS % (MG_N_HG_T * HPB) == 0`` with no ``VALID_HPB`` gating. The
+single-group kernel does implement the documented "NUM_HEADS < HPB=16 zero-pads
++ gates" and does accept 8, but only DSV3_2/GLM_NSA reach it. Decode is
+different again: its dispatch holds (8,128), (8,512), (8,1024) outright.
+
+But an h=8 instantiation would buy ~nothing over h=16, because 8 heads still
+fill a 16-row mma tile. Taking FlashInfer's own two measured points on this
+device -- 4.66 ms at h=16, 13.68 ms at h=64 for the same work -- and solving
+``T16 = G + M``, ``T64 = 2(G + 2M)`` gives a per-CTA gather term G ~ 2.48 and a
+maths term M ~ 2.18, i.e. **h=8 would cost what h=16 costs**.
+
+The lever is one step earlier, in SGLang: ``models/deepseek_v4.py`` pads to 64
+when 16 would be legal and sufficient. Padding 8 -> 16 instead of 8 -> 64 on the
+SM120/FlashInfer route is three lines and worth **2.94x on the baseline**
+(13.68 -> 4.66 ms, both measured here). Stating the consequence plainly: it also
+cuts this kernel's prefill advantage from 5.6x to 1.9x. That is the honest
+number, and it is better found here than by a reviewer.
 
 Measured that way -- FlashInfer in production form (8 real heads padded to 64,
 swa 128 + extra 512, page-split included) against this kernel with 8 real heads,
