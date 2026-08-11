@@ -182,6 +182,48 @@ DeepSeek-V4 is 150 GB across 8 GPUs and does not fit on any single SM120 part:
     T=4096:  SGLang today 297.9 ms | FI h=16 102.8 | ours bf16 54.2 | fp8 44.8
     T=8192:  SGLang today 587.0 ms | FI h=16 204.1 | ours bf16 106.7 | fp8 87.9
 
+Reading the paged fp8 cache natively: it works, and it still loses to bf16
+-----------------------------------------------------------------------------
+``sparse_mla_prefill_paged_fp8`` in this file converts the KV tile in registers
+and therefore never reaches the fp8 tensor core (its compiled kernel emits 128
+bf16 mma and 90368 B of shared memory, i.e. one block per SM). A rewritten
+version that never constructs the tile -- 448-wide nope loaded as 7 chunks of
+64, one ue8m0 scale each, handed to ``tl.dot`` unconverted; the 64-wide bf16
+rope tail given its own dot; the KV scale folded into P before P is quantised --
+does reach it: 56x ``mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`` and
+25344 B shared, **6.21x faster than the version here** (8.19 -> 1.32 ms at
+T=4096).
+
+    T       FI h=64   FI h=16   native fp8   ours bf16   vs FI16   vs bf16
+    512      0.918     0.309      0.213      0.179+.019   1.45x     0.84x
+    2048     3.439     1.195      0.686      0.606+.019   1.74x     0.84x
+    4096     6.867     2.353      1.364      1.239+.019   1.73x     0.83x
+    8192    13.637     4.654      2.705      2.465+.019   1.72x     0.84x
+
+So it clears the bar against FlashInfer and still loses to this file's own bf16
+path. The reason is structural rather than tuning, and it is worth stating
+because it bounds what fp8 can do here in Triton at all: DeepSeek-V4's ue8m0
+scale varies **along** QK's reduction axis (one per 64 of the 448), so it cannot
+be hoisted out of a single dot, and Triton cannot slice a tensor -- all seven
+chunk tiles must stay live from the gather through both dots. Ablated at
+T=4096: 12 extra dots cost 0.133 ms, **6 extra gathers cost 0.853 ms**. The
+gather is ~65% of runtime and the fp8 tensor core accelerates the ~10% that is
+dots. FlashInfer pays neither, with hand-written ``ldmatrix`` against an
+explicit smem layout.
+
+Accuracy: cos 0.9996209 against an fp32 oracle over the dequantised stored KV,
+against 0.9999979 for bf16. **The KV side contributes exactly zero error** -- the
+stored bytes go to the MMA unconverted. 72% of the loss is Q quantisation, which
+is unavoidable for this path: Triton rejects a mixed bf16 x fp8 dot outright
+(``Unsupported rhs dtype fp8e4nv``), so using the fp8 tensor core means
+quantising Q. "No additional accuracy loss" therefore holds on the KV side only.
+
+One frontend note worth recording: ``tl.dot_scaled`` does lower natively on
+sm_120 to the hardware block-scaled instruction FlashInfer hand-writes, but
+**only when both scale operands are real tensors**. With ``lhs_scale=None`` it
+silently takes the documented bf16-upcast emulation (96 bf16 mma, 0.28x speed).
+Pass an all-127 (2^0) lhs tile if only the B side needs scaling.
+
 What it is actually faster than, on DeepSeek-V4 / SM120
 --------------------------------------------------------
 An earlier revision of this note quoted a very large speedup against
