@@ -1291,6 +1291,8 @@ def sparse_mla_prefill(
     dense_config=None,
     int64_indexing=None,
     block_h=None,
+    splits=1,
+    partial_dtype=torch.bfloat16,
 ):
     """Fused sparse-MLA prefill. Returns ``out`` ``[T, H, d_v]`` bf16.
 
@@ -1319,6 +1321,17 @@ def sparse_mla_prefill(
         config / union_config / dense_config: optional tile overrides
             ``(BLOCK_N, num_warps, num_stages)`` (dense takes ``(BM, BN, warps,
             stages)``). Defaults are the per-arch tuned entries in ``_PINNED``.
+        splits: candidate-list splits per query token, for decode. ``1``
+            (default) is the unsplit path this module has always run, bit for
+            bit — no partials, no merge. ``"auto"`` picks a count from the SM
+            count and the batch (see ``auto_splits``). Anything above 1 runs
+            ``_nsa_decode_split_kernel`` on grid ``(T, splits)`` plus
+            ``_nsa_decode_merge_kernel`` on grid ``(T, H)``; the result is
+            algebraically identical but not bitwise, because the softmax is
+            reassociated and the partials round to ``partial_dtype``.
+        partial_dtype: element type of the ``[T, H, splits, d_v]`` partial
+            output. bf16 matches FlashInfer; fp32 doubles the traffic and buys
+            back the reassociation error.
     """
     if kv.dim() == 3:  # [S, 1, D] -> [S, D]
         assert kv.shape[1] == 1
@@ -1394,6 +1407,48 @@ def sparse_mla_prefill(
     else:
         idx64 = bool(int64_indexing)
     block_h = block_h or _block_h(q.device, h)
+
+    if splits == "auto":
+        splits = auto_splits(q.device, T, h, topk, bn, block_h,
+                             min_chunks=_MIN_CHUNKS_BF16)
+    splits = int(splits)
+    if splits > 1:
+        # Decode split-K. Everything below this branch is untouched, so
+        # `splits=1` keeps the base path bit for bit.
+        mid_o, mid_m, mid_l = _split_ws(q.device, T, h, splits, d_v, partial_dtype)
+        for bn_try, ns_try in _smem_fallbacks(bn, stages):
+            try:
+                _nsa_decode_split_kernel[(T, splits)](
+                    q_in,
+                    kv_in,
+                    indices,
+                    topk_length,
+                    mid_o,
+                    mid_m,
+                    mid_l,
+                    sm_scale,
+                    topk,
+                    splits,
+                    H=h,
+                    BLOCK_H=block_h,
+                    D_QK=d_qk,
+                    D_V=d_v,
+                    D_V_PAD=triton.next_power_of_2(d_v),
+                    BLOCK_N=bn_try,
+                    num_warps=warps,
+                    num_stages=ns_try,
+                    IDX64=idx64,
+                )
+                break
+            except triton.runtime.errors.OutOfResources:
+                continue
+        else:
+            raise triton.runtime.errors.OutOfResources(
+                0, 0, "shared memory: no fallback config fits this device/shape"
+            )
+        _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, d_v, splits)
+        return out
+
     for bn_try, ns_try in _smem_fallbacks(bn, stages):
         try:
             _nsa_prefill_kernel[(T,)](
@@ -1711,6 +1766,8 @@ def sparse_mla_prefill_paged_fp8(
     topk_length=None,
     out=None,
     config=None,
+    splits=1,
+    partial_dtype=torch.bfloat16,
 ):
     """Sparse-MLA prefill read straight off one or two paged fp8 KV pools.
 
@@ -1786,6 +1843,56 @@ def sparse_mla_prefill_paged_fp8(
 
     bn, warps, stages = config or _config(q.device, h)
     block_h = _block_h(q.device, h)
+
+    if splits == "auto":
+        splits = auto_splits(
+            q.device, T, h, indices.shape[-1] + (x_topk if has_extra else 0),
+            bn, block_h, min_chunks=_MIN_CHUNKS_FP8
+        )
+    splits = int(splits)
+    if splits > 1:
+        # Decode split-K over the concatenation of the two pools. See
+        # `_nsa_decode_split_paged_fp8_kernel`. `splits=1` leaves the path below
+        # bit for bit unchanged.
+        mid_o, mid_m, mid_l = _split_ws(q.device, T, h, splits, D, partial_dtype)
+        for bn_try, ns_try in _smem_fallbacks(bn, stages):
+            try:
+                _nsa_decode_split_paged_fp8_kernel[(T, splits)](
+                    q, fp8_p, bf16_p, u8_p, indices, topk_length,
+                    x_fp8, x_bf16, x_u8, extra_indices, extra_topk_length,
+                    mid_o, mid_m, mid_l,
+                    sm_scale,
+                    indices.shape[-1],
+                    x_topk,
+                    splits,
+                    H=h,
+                    BLOCK_H=block_h,
+                    D=D,
+                    D_NOPE=d_nope,
+                    SCALE_TILE=scale_tile,
+                    PAGE_SIZE=page_size,
+                    BYTES_PER_PAGE=bpp,
+                    ROW_BYTES=row_bytes,
+                    SCALE_BYTES_PER_TOKEN=sbpt,
+                    S_OFFSET_BYTES=s_off,
+                    X_PAGE_SIZE=extra_page_size or page_size,
+                    X_BYTES_PER_PAGE=x_bpp,
+                    X_S_OFFSET_BYTES=x_s_off,
+                    BLOCK_N=bn_try,
+                    num_warps=warps,
+                    num_stages=ns_try,
+                    HAS_EXTRA=has_extra,
+                )
+                break
+            except triton.runtime.errors.OutOfResources:
+                continue
+        else:
+            raise triton.runtime.errors.OutOfResources(
+                0, 0, "shared memory: no fallback config fits this device/shape"
+            )
+        _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, D, splits)
+        return out
+
     # The decode holds an fp32 staging tile alongside the bf16 one, so a tile the
     # bf16 path fits can miss the smem budget here; step down as it does.
     for bn_try, ns_try in _smem_fallbacks(bn, stages):
@@ -1826,6 +1933,1501 @@ def sparse_mla_prefill_paged_fp8(
                 HAS_EXTRA=has_extra,
                 HAS_SINK=attn_sink is not None,
             )
+            return out
+        except triton.runtime.errors.OutOfResources:
+            continue
+    raise triton.runtime.errors.OutOfResources(
+        0, 0, "shared memory: no fallback config fits this device/shape"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Split-K decode (SM120). VARIANT ADDITION -- everything above this line is a
+# byte-for-byte copy of
+# sglang/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla_prefill.py
+# except for the two `splits=` arguments threaded into the two public entry
+# points, which dispatch here and are a no-op at `splits <= 1`.
+#
+# Why this exists. The base path runs `grid = (T,)`, one program per query
+# token. At decode T is the batch, so batch 1 occupies 1 SM of 84 and the wall
+# time is flat (~0.039 ms bf16, ~0.168 ms paged fp8) from batch 1 to 64: the
+# regime is latency/underfill, not work. Splitting a token's candidate list
+# across S programs and merging the partials is the standard fix and is exactly
+# what FlashInfer's own SM120 DSv4 decode kernel does
+# (`sparse_mla_sm120_decode_dsv4.cu`): stage 1 on grid
+# `(num_tokens, ceil(NH/16), num_splits)` writing `mid_out[T,H,splits,512]` bf16
+# + `mid_lse[T,H,splits]` fp32, stage 2 merging on grid `(T, NH)`.
+#
+# Differences from FlashInfer's form, and why:
+#
+# * **Partials are unnormalised.** FlashInfer stores `acc/l` plus a single
+#   `lse = log2(l) + m`; this stores raw `acc` plus `m` and `l` as two fp32
+#   planes. `(acc, lse)` alone is not a sufficient statistic -- recovering the
+#   merge weight `2^(m - gmax)` from `lse` needs `l` as well -- so the choice is
+#   between one division per split at write time or one extra fp32 plane. The
+#   plane is [T,H,S] (41 KB at T=128,H=8,S=10, against 82 KB of bf16 partials)
+#   and keeps the split kernel's epilogue free of a divide.
+# * **Natural-log domain, not log2.** The base path's `attn_sink` is a raw
+#   natural-log logit and its online softmax runs on `tl.exp`; keeping the merge
+#   in the same domain removes two LOG2E conversions and makes the S=1 merge
+#   algebraically the same expression as the base path's epilogue.
+# * **Whole-tile chunking.** A split covers `ceil(ceil(k_len/BLOCK_N)/S)` whole
+#   BLOCK_N tiles, so every split starts on a tile boundary and gathers exactly
+#   the addresses the unsplit loop would have. This is FlashInfer's
+#   `chunks_per_block` with `chunks_per_block = ceil(num_chunks/S)`.
+#
+# The sink joins the denominator once, in the merge, never per split.
+#
+# Rejected before building (recorded so it is not retried): splitting over `D_V`
+# instead of K. It needs no merge at all -- the splits write disjoint output
+# slices -- but every split still re-gathers all 640 candidate rows, and the
+# gather is ~50% of the runtime, so 4x the gather for 4x the parallelism is a
+# wash.
+#
+# Measured (RTX 5080, 84 SMs, h=8, d=512, swa 128 + c4 512, attn_sink,
+# probe/probe_splitk_decode.py, job 3594983). CUDA-graph replay, which is what
+# an SGLang decode step pays; FlashInfer through SGLang's
+# `_flash_mla_flashinfer` at heads=8 with its page split charged in:
+#
+#     B    fi h=8   bf16 base   bf16 split (S)   fi/split   fp8 base   fp8 split
+#     1    0.0205     0.0391     0.0082 (10)      2.50x      0.1691    0.0143 (20)
+#     4    0.0205     0.0389     0.0087 (10)      2.35x      0.1699    0.0164 (20)
+#     16   0.0266     0.0410     0.0123 (10)      2.16x      0.1700    0.0471 (20)
+#     64   0.0614     0.0411     0.0348 (10)      1.77x      0.1705    0.1556 (10)
+#
+# Two things that are not obvious from the older eager-mode numbers:
+#
+# * **The unsplit bf16 path loses to FlashInfer under CUDA graphs at B <= 32.**
+#   Its 3.1x eager advantage was ~106 us of host overhead in FlashInfer's
+#   wrapper, not GPU time: FlashInfer measures 0.124 ms eager and 0.0205 ms
+#   captured, while this kernel measures 0.039 both ways. Split-K is what makes
+#   the bf16 arm actually win, 1.77-2.50x, and the win is a real one.
+# * **The paged-fp8 arm goes from 0.12x to 1.43x of FlashInfer at B=1** (0.169
+#   -> 0.0143 ms, 11.8x its own unsplit form) and still loses above B=4. The
+#   gather deficit is unchanged; splitting hides it at small batch and cannot at
+#   large.
+# ---------------------------------------------------------------------------
+
+# Split-count policy. All three constants are measured on RTX 5080 (sm_120, 84
+# SMs) at the DSv4 decode shape; see `auto_splits` for what each one does and
+# `probe/probe_splitk_decode.py` section 4 for the surface they were fitted to.
+#
+# The tile count is what bounds the split count from above: DSv4's 640
+# candidates at the pinned BLOCK_N=32 are 20 tiles, so 20 splits is the finest
+# balanced split available (FlashInfer, chunking 64 at a time, reaches 10). The
+# claim that going past 10 is "wasteful" holds for the bf16 arm and is false for
+# the paged-fp8 one, which is 1.55x faster at S=20 than at S=10 for B <= 4.
+_BLOCKS_PER_SM = 2  # NCU: the base tile is register- and smem-limited to 2/SM
+_MAX_WAVES = 4  # past this the partial traffic costs more than the parallelism
+_MIN_CHUNKS_BF16 = 2  # >= 64 candidates per split amortises a bf16 split
+_MIN_CHUNKS_FP8 = 1  # the paged gather is ~4x costlier per candidate, so 32 does
+
+
+@triton.jit
+def _nsa_decode_split_kernel(
+    q_ptr,
+    kv_ptr,
+    idx_ptr,
+    len_ptr,
+    mid_o_ptr,  # [T, H, splits, D_V] -- unnormalised acc
+    mid_m_ptr,  # [T, H, splits] fp32 -- running max, -inf for an empty split
+    mid_l_ptr,  # [T, H, splits] fp32 -- running denominator, 0 for an empty split
+    sm_scale,
+    topk,
+    splits,  # runtime, not constexpr: one compilation serves every batch size
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_QK: tl.constexpr,
+    D_V: tl.constexpr,
+    D_V_PAD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IDX64: tl.constexpr,
+):
+    """`_nsa_prefill_kernel`'s loop over a slice of the candidate list.
+
+    Identical body, different bounds, and no epilogue: no sink, no normalise.
+    Program `(t, s)` owns candidate tiles `[s*C, (s+1)*C)` of token `t`.
+    """
+    t = tl.program_id(0)
+    s = tl.program_id(1)
+    D_TAIL: tl.constexpr = D_QK - D_V
+
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
+    dv = tl.arange(0, D_V_PAD)
+    vmask = dv < D_V
+
+    qb = q_ptr + t * H * D_QK
+    q_main = tl.load(
+        qb + h[:, None] * D_QK + dv[None, :],
+        mask=hmask[:, None] & vmask[None, :],
+        other=0.0,
+    )
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+        q_tail = tl.load(
+            qb + h[:, None] * D_QK + (D_V + dt)[None, :], mask=hmask[:, None], other=0.0
+        )
+
+    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_H], tl.float32)
+    acc = tl.zeros([BLOCK_H, D_V_PAD], tl.float32)
+
+    n = tl.arange(0, BLOCK_N)
+    k_len = tl.load(len_ptr + t)
+    # Whole BLOCK_N tiles per split, so a split's gather addresses are exactly a
+    # contiguous run of the ones the unsplit loop would have issued. An
+    # over-allocated split gets lo >= hi and simply runs zero iterations, then
+    # stores m = -inf / l = 0 / acc = 0, which the merge weights to nothing --
+    # the same early-exit-with-a-sentinel that FlashInfer writes explicitly.
+    c_tiles = tl.cdiv(tl.cdiv(k_len, BLOCK_N), splits)
+    lo = s * c_tiles * BLOCK_N
+    hi = tl.minimum(lo + c_tiles * BLOCK_N, k_len)
+    for k0 in tl.range(lo, hi, BLOCK_N):
+        idx = tl.load(idx_ptr + t * topk + k0 + n, mask=(k0 + n) < hi, other=-1)
+        valid = idx >= 0
+        if IDX64:
+            row = tl.where(valid, idx, 0).to(tl.int64)
+        else:
+            row = tl.where(valid, idx, 0)
+        kb = kv_ptr + row[:, None] * D_QK
+        kv_main = tl.load(
+            kb + dv[None, :], mask=valid[:, None] & vmask[None, :], other=0.0
+        )
+
+        qk = tl.dot(q_main, tl.trans(kv_main))
+        if D_TAIL > 0:
+            kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=valid[:, None], other=0.0)
+            qk = tl.dot(q_tail, tl.trans(kv_tail), qk)
+        qk = qk * sm_scale
+        qk = tl.where(valid[None, :], qk, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(qk - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv_main.dtype), kv_main)
+        m_i = m_new
+
+    mbase = ((t * H + h).to(tl.int64) * splits) + s
+    tl.store(mid_m_ptr + mbase, m_i, mask=hmask)
+    tl.store(mid_l_ptr + mbase, l_i, mask=hmask)
+    tl.store(
+        mid_o_ptr + mbase[:, None] * D_V + dv[None, :],
+        acc.to(mid_o_ptr.dtype.element_ty),
+        mask=hmask[:, None] & vmask[None, :],
+    )
+
+
+@triton.jit
+def _nsa_decode_split_paged_fp8_kernel(
+    q_ptr,
+    fp8_ptr,
+    bf16_ptr,
+    u8_ptr,
+    idx_ptr,
+    len_ptr,
+    x_fp8_ptr,
+    x_bf16_ptr,
+    x_u8_ptr,
+    x_idx_ptr,
+    x_len_ptr,
+    mid_o_ptr,
+    mid_m_ptr,
+    mid_l_ptr,
+    sm_scale,
+    topk,
+    x_topk,
+    splits,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    SCALE_TILE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    X_PAGE_SIZE: tl.constexpr,
+    X_BYTES_PER_PAGE: tl.constexpr,
+    X_S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+):
+    """Split-K over the *concatenation* of the two pools.
+
+    The two pools are one candidate list as far as the softmax is concerned, so
+    the split axis is the concatenated tile index: tiles `[0, ta)` address the
+    SWA pool and `[ta, ta+tb)` the compressed one. Splitting each pool
+    separately would give the 128-wide sliding window and the 512-wide selection
+    the same number of programs, which is 4x the wrong ratio.
+    """
+    t = tl.program_id(0)
+    s = tl.program_id(1)
+
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
+    d = tl.arange(0, D)
+    is_nope = d < D_NOPE
+    rope_col = tl.where(is_nope, 0, d - D_NOPE)
+    s_lane = tl.arange(0, D // SCALE_TILE)
+
+    q = tl.load(
+        q_ptr + t * H * D + h[:, None] * D + d[None, :], mask=hmask[:, None], other=0.0
+    )
+
+    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_H], tl.float32)
+    acc = tl.zeros([BLOCK_H, D], tl.float32)
+    n = tl.arange(0, BLOCK_N)
+
+    k_len = tl.load(len_ptr + t)
+    ta = tl.cdiv(k_len, BLOCK_N)
+    if HAS_EXTRA:
+        x_len = tl.load(x_len_ptr + t)
+        tb = tl.cdiv(x_len, BLOCK_N)
+    else:
+        x_len = 0
+        tb = 0
+    c_tiles = tl.cdiv(ta + tb, splits)
+    tlo = s * c_tiles
+    thi = tl.minimum(tlo + c_tiles, ta + tb)
+
+    a_lo = tl.minimum(tlo, ta) * BLOCK_N
+    a_hi = tl.minimum(tl.minimum(thi, ta) * BLOCK_N, k_len)
+    for k0 in tl.range(a_lo, a_hi, BLOCK_N):
+        idx = tl.load(idx_ptr + t * topk + k0 + n, mask=(k0 + n) < a_hi, other=-1)
+        kv, valid = _paged_fp8_row_tile(
+            fp8_ptr, bf16_ptr, u8_ptr, idx, d, is_nope, rope_col, s_lane,
+            BLOCK_N=BLOCK_N, N_LANES=D // SCALE_TILE,
+            NOPE_LANES=D_NOPE // SCALE_TILE, SCALE_TILE=SCALE_TILE,
+            D_NOPE=D_NOPE, PAGE_SIZE=PAGE_SIZE, BYTES_PER_PAGE=BYTES_PER_PAGE,
+            ROW_BYTES=ROW_BYTES, SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+            S_OFFSET_BYTES=S_OFFSET_BYTES,
+        )
+        qk = tl.dot(q, tl.trans(kv)) * sm_scale
+        qk = tl.where(valid[None, :], qk, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(qk - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+
+    if HAS_EXTRA:
+        b_lo = tl.maximum(tlo - ta, 0) * BLOCK_N
+        b_hi = tl.minimum(tl.maximum(thi - ta, 0) * BLOCK_N, x_len)
+        for k0 in tl.range(b_lo, b_hi, BLOCK_N):
+            idx = tl.load(
+                x_idx_ptr + t * x_topk + k0 + n, mask=(k0 + n) < b_hi, other=-1
+            )
+            kv, valid = _paged_fp8_row_tile(
+                x_fp8_ptr, x_bf16_ptr, x_u8_ptr, idx, d, is_nope, rope_col, s_lane,
+                BLOCK_N=BLOCK_N, N_LANES=D // SCALE_TILE,
+                NOPE_LANES=D_NOPE // SCALE_TILE, SCALE_TILE=SCALE_TILE,
+                D_NOPE=D_NOPE, PAGE_SIZE=X_PAGE_SIZE,
+                BYTES_PER_PAGE=X_BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+                SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+                S_OFFSET_BYTES=X_S_OFFSET_BYTES,
+            )
+            qk = tl.dot(q, tl.trans(kv)) * sm_scale
+            qk = tl.where(valid[None, :], qk, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+            m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+            alpha = tl.exp(m_i - m_safe)
+            p = tl.exp(qk - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+            m_i = m_new
+
+    mbase = ((t * H + h).to(tl.int64) * splits) + s
+    tl.store(mid_m_ptr + mbase, m_i, mask=hmask)
+    tl.store(mid_l_ptr + mbase, l_i, mask=hmask)
+    tl.store(
+        mid_o_ptr + mbase[:, None] * D + d[None, :],
+        acc.to(mid_o_ptr.dtype.element_ty),
+        mask=hmask[:, None],
+    )
+
+
+@triton.jit
+def _nsa_decode_merge_kernel(
+    mid_o_ptr,
+    mid_m_ptr,
+    mid_l_ptr,
+    o_ptr,
+    sink_ptr,  # [H] fp32; unused when not HAS_SINK
+    splits,
+    H: tl.constexpr,
+    D_V: tl.constexpr,
+    D_V_PAD: tl.constexpr,
+    SPLIT_PAD: tl.constexpr,  # next power of two >= splits; tl.arange needs one
+    HAS_SINK: tl.constexpr,
+):
+    """One program per (token, head). Log-domain max over the splits, rescale,
+    sum, fold the sink in once, divide once."""
+    t = tl.program_id(0)
+    hh = tl.program_id(1)
+
+    sp = tl.arange(0, SPLIT_PAD)
+    spm = sp < splits
+    dv = tl.arange(0, D_V_PAD)
+    vmask = dv < D_V
+
+    base = (t * H + hh).to(tl.int64) * splits + sp
+    m_all = tl.load(mid_m_ptr + base, mask=spm, other=-float("inf"))
+    l_all = tl.load(mid_l_ptr + base, mask=spm, other=0.0)
+
+    gm = tl.max(m_all, axis=0)
+    if HAS_SINK:
+        # The sink is a raw natural-log logit joining the denominator without a
+        # value row; it enters the global max so exp(sink - gm) cannot overflow
+        # when every real logit sits far below it. Exactly once, here -- the
+        # split kernel never sees it.
+        sink = tl.load(sink_ptr + hh).to(tl.float32)
+        gm = tl.maximum(gm, sink)
+    gm = tl.where(gm == -float("inf"), 0.0, gm)
+
+    w = tl.where(m_all == -float("inf"), 0.0, tl.exp(m_all - gm))
+    den = tl.sum(w * l_all, axis=0)
+    if HAS_SINK:
+        den += tl.exp(sink - gm)
+
+    a = tl.load(
+        mid_o_ptr + base[:, None] * D_V + dv[None, :],
+        mask=spm[:, None] & vmask[None, :],
+        other=0.0,
+    )
+    num = tl.sum(w[:, None] * a.to(tl.float32), axis=0)
+
+    den = tl.where(den == 0.0, 1.0, den)
+    tl.store(
+        o_ptr + (t * H + hh).to(tl.int64) * D_V + dv,
+        (num / den).to(o_ptr.dtype.element_ty),
+        mask=vmask,
+    )
+
+
+def auto_splits(device, num_tokens, num_heads, topk_total, block_n, block_h,
+                min_chunks=_MIN_CHUNKS_BF16, blocks_per_sm=_BLOCKS_PER_SM,
+                max_waves=_MAX_WAVES):
+    """How many candidate-list splits to run, host-side. Three rules, in order.
+
+    1. **Splits are derived from a chunks-per-split, never the other way round.**
+       ``S = ceil(n_tiles / cpb)`` is what the kernel actually computes, so
+       choosing ``S`` directly can land on a ratio that leaves the last split
+       short: at ``n_tiles=20``, ``S=3`` gives 7/7/6 tiles and measures *slower*
+       than ``S=2``'s 10/10 (0.109 vs 0.091 ms, paged fp8, B=32). Enumerating
+       ``cpb`` makes every split the same size by construction. This is
+       FlashInfer's ``chunks_per_block`` parametrisation, and the reason for it.
+    2. **Split until the device is full, then stop.** ``max_waves`` waves at
+       ``blocks_per_sm`` resident blocks bounds the partial traffic, which is
+       what makes over-splitting lose rather than merely stop helping: at B=64
+       the paged-fp8 arm at S=20 writes and reads back 21 MB of partials and
+       runs 0.176 ms against the unsplit path's 0.170 -- the only measured
+       configuration where splitting is worse than not splitting.
+    3. **``min_chunks`` is per-arm and measured, not a constant.** A split has a
+       fixed cost (q load, epilogue, partial write) that its tiles amortise. The
+       bf16 gather needs 2 tiles (64 candidates) to cover it; the paged-fp8
+       gather is ~4x costlier per candidate, so 1 tile already does, and forcing
+       2 on it costs 1.55x at B<=4 (0.0225 vs 0.0145 ms). Hence
+       ``_MIN_CHUNKS_BF16 = 2``, ``_MIN_CHUNKS_FP8 = 1``.
+
+    Rejected: FlashInfer's own rule (minimise ``ceil(waves) - waves`` among
+    candidates within 3 integer waves). It optimises the tail gap of the last
+    wave, which assumes waves serialise; on this shape they do not -- 160 blocks
+    of 2 tiles beat 80 blocks of 4 tiles at B=16 on both arms, i.e. two nominal
+    waves beat one. Its objective picks 5 splits at B=16 where 10 measures 1.17x
+    faster.
+    """
+    sm = torch.cuda.get_device_properties(device).multi_processor_count
+    per_token = triton.cdiv(num_heads, block_h)  # blocks the base path already has
+    n_tiles = triton.cdiv(topk_total, block_n)
+    room = max(1, (max_waves * blocks_per_sm * sm) // max(1, num_tokens * per_token))
+    s_cap = max(1, min(room, n_tiles // max(1, min_chunks)))
+    cpb = max(min_chunks, triton.cdiv(n_tiles, s_cap))
+    return max(1, triton.cdiv(n_tiles, cpb))
+
+
+# Partial-output scratch, grown in place and keyed only by (device, dtype) so a
+# server's decode loop allocates once. Reusing it also keeps the path
+# CUDA-graph-capturable: nothing is allocated inside the captured region.
+_SPLIT_WS = {}
+
+
+def _split_ws(device, num_tokens, num_heads, splits, d_v, dtype):
+    n_o = num_tokens * num_heads * splits * d_v
+    n_s = num_tokens * num_heads * splits
+    key = (device, dtype)
+    ws = _SPLIT_WS.get(key)
+    if ws is None or ws[0].numel() < n_o or ws[1].numel() < n_s:
+        ws = (
+            torch.empty(n_o, dtype=dtype, device=device),
+            torch.empty(n_s, dtype=torch.float32, device=device),
+            torch.empty(n_s, dtype=torch.float32, device=device),
+        )
+        _SPLIT_WS[key] = ws
+    return ws
+
+
+def _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, d_v, splits):
+    split_pad = triton.next_power_of_2(splits)
+    _nsa_decode_merge_kernel[(T, h)](
+        mid_o,
+        mid_m,
+        mid_l,
+        out,
+        attn_sink if attn_sink is not None else mid_l,  # unread placeholder
+        splits,
+        H=h,
+        D_V=d_v,
+        D_V_PAD=triton.next_power_of_2(d_v),
+        SPLIT_PAD=split_pad,
+        HAS_SINK=attn_sink is not None,
+        num_warps=4 if split_pad <= 16 else 8,
+        num_stages=1,
+    )
+
+
+# ===========================================================================
+# EVERYTHING BELOW THIS LINE IS `variants/tsmp_paged_native.py`'s native
+# paged-fp8 section, verbatim, plus one addition:
+# `_nsa_decode_split_paged_fp8_native_kernel`, which is that section's
+# `_native_tile` driven by the split/merge structure defined above.
+#
+# This file is therefore the union of two variants that were each measured on
+# their own and never together:
+#
+#   A  variants/tsmp_paged_native.py -- the native gather. 6.21x the older
+#      `sparse_mla_prefill_paged_fp8` at prefill (8.19 -> 1.32 ms, T=4096),
+#      1.72x FlashInfer h=16, cos 0.9996209 vs an fp32 oracle over the
+#      dequantised stored KV.
+#   B  variants/tsmp_splitk.py -- the split-K decode. 1.77-2.50x FlashInfer on
+#      bf16 under CUDA-graph replay, but its paged-fp8 arm was built on the
+#      *old* gather and lost above B=4 (0.77x at 8, 0.39x at 64).
+#
+# Neither source file is modified; both are still on disk and still run.
+#
+# MEASURED (probe/probe_splitk_native.py, job 3595743; RTX 5080 sm_120, 84 SMs,
+# h=8 d=512 swa 128 + c4 512, attn_sink, CUDA-graph replay -- which is what an
+# SGLang decode step pays. FlashInfer is its own SM120 DSv4 decode kernel
+# through SGLang's `_flash_mla_flashinfer` at heads=8, with the pbs 256 -> 64
+# page split inside the timed call, i.e. charged to it):
+#
+#     B    fi h=8   native unsplit   native split-K (S)   vs fi   old-gather split
+#     1    0.0205       0.0430          0.0103 (10)       2.00x     0.0144  1.43x
+#     2    0.0205       0.0430          0.0103 (10)       2.00x     0.0155  1.32x
+#     4    0.0205       0.0430          0.0103 (10)       2.00x     0.0162  1.26x
+#     8    0.0205       0.0430          0.0102 (10)       2.00x     0.0252  0.81x
+#     16   0.0250       0.0430          0.0123 (10)       2.03x     0.0471  0.53x
+#     32   0.0392       0.0431          0.0184 (5)        2.13x     0.0912  0.43x
+#     64   0.0611       0.0445          0.0348 (2)        1.75x     0.1555  0.39x
+#     128  refused      0.0573          0.0573 (1)          --      0.2914    --
+#
+# **The crossover is gone.** The old-gather arm fell under 1.0x between B=4 and
+# B=8 and reached 0.39x at 64; this one holds 1.75-2.13x across every batch size
+# FlashInfer will run, so fp8 decode now clears the same >1.5x bar the bf16 arm
+# and both prefill arms already cleared. FlashInfer refuses B=128 outright
+# ("Unsupported sparse-MLA prefill configuration"), so that row has no baseline;
+# `auto_splits` correctly returns S=1 there and the split path costs nothing.
+#
+# Accuracy, against an fp32 oracle over the DEQUANTISED STORED KV -- the only
+# reference that means anything for a cache that stores fp8, since the original
+# bf16 tensor is not what any reader of this cache can return:
+#
+#     cos 0.9995876 - 0.9996418 at every one of the 56 (B, S) pairs measured,
+#     flat in S to the 6th decimal. The unsplit native kernel scores the same,
+#     so splitting costs nothing here; the bf16 arm is 0.9999979.
+#
+# Split reassociation on its own, against this module's own unsplit output:
+# cos >= 0.9999964, max_abs 0.00195 = exactly one bf16 ULP for outputs in
+# [0.5, 1). `splits=1` is `torch.equal` to the unsplit kernel at every batch
+# size and on three different tiles.
+#
+# The split kernel keeps the fp8 tensor core -- that was the whole point of A
+# and splitting could have lost it. Compiled PTX, BLOCK_N=64:
+#   _nsa_decode_split_paged_fp8_native_kernel  112 x m16n8k32...e4m3.e4m3.f32
+#                                              +32 x m16n8k16...bf16 (the rope
+#                                              dots), 48384 B shared
+#   _nsa_decode_split_paged_fp8_kernel (old)     0 x e4m3, 128 x bf16, 90368 B
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Native paged-fp8 sparse MLA (DeepSeek-V4, SM120).
+#
+# DSv4's KV cache is *already* fp8. Per token the pool holds
+#
+#     [0    : 448)  fp8 e4m3 "nope", under 7 ue8m0 scale bytes (one per 64)
+#     [448  : 576)  bf16 "rope" tail, 64 elements
+#     footer, 8 B   the 7 scale bytes (+1 pad), after the page's data region
+#
+# and the attention head is the whole 512 = 448 + 64, i.e. the rope half is part
+# of both the key and the value. So the correct kernel *quantises nothing on the
+# KV side*: it consumes the stored bytes and the stored exponents as they are,
+# which is zero additional KV error by construction. Only Q is quantised.
+#
+# The previous attempt (`_paged_fp8_row_tile`, kept upstream) measured 2.33x
+# *slower* than bf16 and emitted zero fp8 mma. The cause was structural, not
+# tuning: it *computed* the KV tile in registers (dequantise -> scale ->
+# `tl.where` select), and a register-resident value cannot be an mma operand, so
+# Triton wrote it back to shared memory in two layouts -- 90368 B of smem
+# against bf16's 41728, one block per SM instead of two, plus 256 scalar
+# `st.shared.b16` and 56 `cvt`, and the same 64 bf16 `HMMA`.
+#
+# The fix is to never construct the KV tile:
+#
+#   * the 448-wide nope is loaded as 7 chunks of 64, each exactly one ue8m0
+#     scale wide, and handed to `tl.dot` as fp8 with no conversion at all;
+#   * the 64-wide bf16 rope tail gets its own 64-wide load and its own small
+#     bf16 dot, instead of riding a full-width [BLOCK_N, 512] masked load;
+#   * the scales are read at their true width (one byte per row per chunk) and
+#     never broadcast to a [BLOCK_N, 512] fp32 tile.
+#
+# Every load is its natural width, so no load is column-masked and none is
+# widened to a power of two.
+#
+# Why 7 chunks rather than one 448-wide dot: the ue8m0 scale varies along the
+# reduction axis of QK, so it cannot be lifted out of a single dot. Chunking at
+# the scale granularity makes it a per-chunk constant that folds into an fp32
+# multiply on the [BLOCK_H, BLOCK_N] logit tile. This costs no mma: 7 dots of
+# K=64 issue exactly the same number of m16n8k32 instructions as one dot of
+# K=448 would.
+#
+# PV cannot use the same trick, because there the scale varies along the
+# reduction axis (tokens) rather than across it -- which is also why the
+# hardware block-scaled mma cannot express it, since that form needs the scale
+# constant over 32 contiguous reduction elements. So PV follows FlashInfer
+# (`sparse_mla_sm120/prefill_kernel.cuh` around 466-476 and 503-507): fold the
+# KV dequant scale into P *before* quantising P, leaving the PV mma with no
+# B-side scale and an epilogue of one fp32 multiply per accumulator element.
+#
+# MEASURED OUTCOME (RTX 5080, sm_120, T=4096, h=8, topk 128+512, best tile
+# BLOCK_N=64 / warps=4 / stages=2 / BLOCK_H=8):
+#
+#   vs FlashInfer, 8 heads padded to 64 (what a TP8 deployment runs)   5.04x
+#   vs FlashInfer at heads=16 (its narrowest instantiation, a bound)   1.72x
+#   vs the previous paged-fp8 attempt                                  6.21x
+#   vs this file's own bf16 path over a dequantised workspace          0.84x
+#
+# So it clears the >1.5x-over-FlashInfer bar but does NOT beat the bf16 path,
+# and the reason is structural rather than tuning. Ablation at T=4096
+# (probe_native_attrib.py), holding everything else fixed:
+#
+#   1 gather,  3 dots   0.331 ms
+#   1 gather, 15 dots   0.464 ms    <- the 12 extra dots cost 0.133 ms
+#   7 gathers, 15 dots  1.317 ms    <- the 6 extra gathers cost 0.853 ms
+#
+# The gather is ~65% of runtime and the dots the fp8 tensor core accelerates are
+# ~10%. DSv4's per-64 ue8m0 layout forces seven chunk tiles to be live from the
+# gather through both the QK dots and the PV dots, because Triton cannot slice a
+# tensor: QK needs a per-chunk scale along the reduction axis, and PV needs a
+# differently-scaled P per output chunk. Seven live tiles cost far more than the
+# 2x on the mma saves. FlashInfer pays neither, because it hand-writes ldmatrix
+# against an explicit smem layout with warp specialisation -- which is exactly
+# the part Triton does not expose.
+#
+# Accuracy, against an fp32 oracle over the dequantised stored KV:
+#   this kernel 0.9996209   (Q quantisation 72% of the 1-cos loss, P 28%)
+#   bf16 path   0.9999979
+# The KV side is exact by construction, so the whole gap is the price of
+# reaching the fp8 tensor core: QK cannot take a bf16 Q against an fp8 K
+# (Triton rejects the mixed dot outright -- "Unsupported rhs dtype fp8e4nv").
+# ---------------------------------------------------------------------------
+
+_FP8_DTYPE = torch.float8_e4m3fn
+
+# Architectures whose tensor core executes e4m3 mma natively. sm_121 is left out
+# deliberately: it software-emulates fp8 mma by upcasting, so `tl.dot` on fp8
+# there costs *more* than the bf16 path it would replace. Note `_PINNED` does
+# carry a (12, 1) entry, so this must be membership in an explicit set and never
+# a `>=` comparison on the capability tuple.
+_FP8_MMA_CAPS = frozenset({(8, 9), (12, 0)})
+
+
+def _has_fp8_mma(device=None):
+    """Whether this device runs e4m3 mma on the tensor core rather than by
+    upcasting. See `_FP8_MMA_CAPS`."""
+    return torch.cuda.get_device_capability(device) in _FP8_MMA_CAPS
+
+
+@triton.jit
+def _kv_chunk(
+    fp8_ptr, u8_ptr, base, sbase, valid, col,
+    I: tl.constexpr, SCALE_TILE: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """One 64-wide fp8 chunk and its ue8m0 dequant scale, both at true width.
+
+    The tile is returned as fp8 and never converted, so it can be an mma operand
+    in either orientation. The scale is one byte per row, not a [BLOCK_N, 512]
+    broadcast.
+    """
+    kv = tl.load(
+        fp8_ptr + base[:, None] + I * SCALE_TILE + col[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+    # ue8m0 is a biased power-of-two exponent, so dequant is exp2, not a
+    # multiply by a stored float. 255 is the non-finite encoding; clamping keeps
+    # a corrupt footer from turning the whole tile into NaN.
+    eb = tl.load(u8_ptr + sbase + I, mask=valid, other=0)
+    e = eb.to(tl.float32)
+    # tl.dot_scaled wants the B scale as [N, K//32]; one stored byte covers
+    # SCALE_TILE=64 values, i.e. two 32-wide mma scale blocks.
+    return (
+        kv,
+        tl.exp2(tl.minimum(e, 254.0) - 127.0),
+        tl.broadcast_to(eb[:, None], (BLOCK_N, SCALE_TILE // 32)),
+    )
+
+
+@triton.jit
+def _q_chunk(qb, hmask, col, sm_scale, I: tl.constexpr, SCALE_TILE: tl.constexpr):
+    """Quantise one 64-wide Q chunk to fp8 with a per-(row, chunk) scale.
+
+    Runs once per program, outside the k loop. Returning the scale with sm_scale
+    and the fp8 range already folded in means the QK epilogue is a single
+    multiply.
+    """
+    qc = tl.load(
+        qb + I * SCALE_TILE + col[None, :], mask=hmask[:, None], other=0.0
+    ).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(qc), axis=1), 1e-30)
+    return (qc * (448.0 / amax)[:, None]).to(tl.float8e4nv), amax * (sm_scale / 448.0)
+
+
+@triton.jit
+def _pv_chunk(acc, alpha, p, kv, ksc, PV_ROWMAX: tl.constexpr):
+    """Accumulate one 64-wide output chunk of P @ V.
+
+    The KV dequant scale varies along the reduction axis, so it cannot be lifted
+    out of the dot and the hardware block-scaled mma cannot express it either
+    (that form needs the scale constant over 32 contiguous reduction elements).
+    Fold it into P before quantising P instead, exactly as FlashInfer does
+    (`sparse_mla_sm120/prefill_kernel.cuh` 466-476, 503-507): the mma then takes
+    no B-side scale and the epilogue is one fp32 multiply per element.
+
+    p is in [0, 1] and ksc > 0, so ws >= 0 and the row max is the full range --
+    no clamp is needed before the cast.
+    """
+    ws = p * ksc[None, :]
+    if PV_ROWMAX:
+        # Tightest scale, but a [BLOCK_H, BLOCK_N] reduction per chunk.
+        amax = tl.maximum(tl.max(ws, axis=1), 1e-30)
+        p8 = (ws * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+        return acc * alpha[:, None] + tl.dot(p8, kv) * (amax * (1.0 / 448.0))[:, None]
+    # p is in [0, 1], so max_n(ksc) bounds every row of ws: the scale becomes a
+    # per-chunk scalar and the reduction shrinks from [BLOCK_H, BLOCK_N] to
+    # [BLOCK_N]. Costs mantissa only on rows whose own max is far below it.
+    cmax = tl.maximum(tl.max(ksc, axis=0), 1e-30)
+    p8 = (ws * (448.0 / cmax)).to(tl.float8e4nv)
+    return acc * alpha[:, None] + tl.dot(p8, kv) * (cmax * (1.0 / 448.0))
+
+
+@triton.jit
+def _qk_chunk(qk, q8, qsc, kv, ksc, ksc_u8, QK_SCALED: tl.constexpr):
+    """Accumulate one 64-wide chunk of Q @ K^T.
+
+    QK_SCALED picks how the stored ue8m0 reaches the maths. Both forms issue the
+    same number of m16n8k32 instructions:
+      False -- plain fp8 mma, scale folded as an fp32 outer product on the
+               [BLOCK_H, BLOCK_N] logit tile.
+      True  -- `tl.dot_scaled`, which lowers on sm_120 to
+               `mma.sync...kind::mxf8f6f4.block_scale.scale_vec::1X...ue8m0`,
+               the instruction FlashInfer hand-writes, with zero dequant
+               instructions. The Q scale stays outside because it is constant
+               along the reduction axis, so lhs_scale is None.
+    """
+    if QK_SCALED:
+        return qk + tl.dot_scaled(
+            q8, None, "e4m3", tl.trans(kv), ksc_u8, "e4m3"
+        ) * qsc[:, None]
+    return qk + tl.dot(q8, tl.trans(kv)) * (qsc[:, None] * ksc[None, :])
+
+
+@triton.jit
+def _native_tile(
+    # running online-softmax state, one accumulator per 64-wide output chunk
+    m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar,
+    # query: 7 fp8 nope chunks with their per-(row, chunk) dequant scales, and
+    # the bf16 rope tail. Quantised once per program, outside the k loop.
+    q0, q1, q2, q3, q4, q5, q6,
+    s0, s1, s2, s3, s4, s5, s6,
+    q_rope,
+    # pool: three aliased views of the same bytes, plus this tile's token ids
+    fp8_ptr, bf16_ptr, u8_ptr, idx,
+    col, rcol, sm_scale,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    SCALE_TILE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    IDX64: tl.constexpr,
+    QK_SCALED: tl.constexpr,
+    PV_ROWMAX: tl.constexpr,
+    ABL_LOAD: tl.constexpr,
+    ABL_DOT: tl.constexpr,
+):
+    """One KV tile: gather, QK, online softmax, PV. Returns the updated state.
+
+    Inlined into the caller and written as straight-line named values. Triton
+    3.6 rejects Python list mutation inside `tl.static_range` ("kvs.append(kv)"
+    fails to compile), and a list element rebound inside a dynamic `tl.range`
+    would not be picked up as a loop-carried value, so the ten accumulators
+    cross the k loop as plain names and the seven chunks are unrolled by hand.
+    """
+    valid = idx >= 0
+    loc = tl.where(valid, idx, 0)
+    if IDX64:
+        loc = loc.to(tl.int64)
+    page = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    # Byte offsets: the data region holds ROW_BYTES per token, and the page's
+    # scale footer starts after it.
+    base = page * BYTES_PER_PAGE + in_page * ROW_BYTES
+    sbase = (
+        page * BYTES_PER_PAGE + S_OFFSET_BYTES + in_page * SCALE_BYTES_PER_TOKEN
+    )
+
+    # ---- gather -----------------------------------------------------------
+    # Explicitly unrolled: Triton 3.6 rejects Python list mutation inside
+    # tl.static_range, so the seven chunks are named values. Nothing here is
+    # converted or selected -- k0..k6 stay fp8 all the way into the mma, in both
+    # orientations.
+    k0, c0, u0 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 0, SCALE_TILE, BLOCK_N)
+    if ABL_LOAD:
+        # Attribution only, and deliberately wrong: chunk 0 stands in for all
+        # seven, so every dot, reduction and quantisation still happens and the
+        # only thing that changes is the gather instruction count, 7 -> 1. The
+        # gap to the real kernel is what the seven separate gathers cost.
+        k1, c1, u1 = k0, c0, u0
+        k2, c2, u2 = k0, c0, u0
+        k3, c3, u3 = k0, c0, u0
+        k4, c4, u4 = k0, c0, u0
+        k5, c5, u5 = k0, c0, u0
+        k6, c6, u6 = k0, c0, u0
+    else:
+        k1, c1, u1 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 1, SCALE_TILE, BLOCK_N)
+        k2, c2, u2 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 2, SCALE_TILE, BLOCK_N)
+        k3, c3, u3 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 3, SCALE_TILE, BLOCK_N)
+        k4, c4, u4 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 4, SCALE_TILE, BLOCK_N)
+        k5, c5, u5 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 5, SCALE_TILE, BLOCK_N)
+        k6, c6, u6 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 6, SCALE_TILE, BLOCK_N)
+    # The rope tail gets its own 64-wide load rather than riding a full-width
+    # [BLOCK_N, 512] masked one.
+    rope = tl.load(
+        bf16_ptr + (base[:, None] + D_NOPE) // 2 + rcol[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+
+    # ---- QK: 7 fp8 chunk dots + one bf16 rope dot -------------------------
+    # sm_scale is folded into each s_i for the fp8 chunks; the rope dot takes it
+    # on the fp32 result rather than by pre-scaling q_rope, which would round a
+    # second time in bf16.
+    qk = tl.dot(q_rope, tl.trans(rope)) * sm_scale
+    qk = _qk_chunk(qk, q0, s0, k0, c0, u0, QK_SCALED)
+    if not ABL_DOT:
+        qk = _qk_chunk(qk, q1, s1, k1, c1, u1, QK_SCALED)
+        qk = _qk_chunk(qk, q2, s2, k2, c2, u2, QK_SCALED)
+        qk = _qk_chunk(qk, q3, s3, k3, c3, u3, QK_SCALED)
+        qk = _qk_chunk(qk, q4, s4, k4, c4, u4, QK_SCALED)
+        qk = _qk_chunk(qk, q5, s5, k5, c5, u5, QK_SCALED)
+        qk = _qk_chunk(qk, q6, s6, k6, c6, u6, QK_SCALED)
+    qk = tl.where(valid[None, :], qk, -float("inf"))
+
+    # ---- online softmax ---------------------------------------------------
+    m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+    # Guards a tile whose slots are all empty, where m_new is still -inf.
+    m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+    alpha = tl.exp(m_i - m_safe)
+    p = tl.exp(qk - m_safe[:, None])
+    l_i = l_i * alpha + tl.sum(p, axis=1)
+
+    # ---- PV ---------------------------------------------------------------
+    a0 = _pv_chunk(a0, alpha, p, k0, c0, PV_ROWMAX)
+    if not ABL_DOT:
+        a1 = _pv_chunk(a1, alpha, p, k1, c1, PV_ROWMAX)
+        a2 = _pv_chunk(a2, alpha, p, k2, c2, PV_ROWMAX)
+        a3 = _pv_chunk(a3, alpha, p, k3, c3, PV_ROWMAX)
+        a4 = _pv_chunk(a4, alpha, p, k4, c4, PV_ROWMAX)
+        a5 = _pv_chunk(a5, alpha, p, k5, c5, PV_ROWMAX)
+        a6 = _pv_chunk(a6, alpha, p, k6, c6, PV_ROWMAX)
+    # The rope half of V is stored bf16; quantising it would add KV error the
+    # cache does not already carry, so it keeps a bf16 dot.
+    ar = ar * alpha[:, None] + tl.dot(p.to(tl.bfloat16), rope)
+
+    return m_new, l_i, a0, a1, a2, a3, a4, a5, a6, ar
+
+
+@triton.jit
+def _nsa_prefill_paged_fp8_native_kernel(
+    q_ptr,
+    fp8_ptr,  # pool bytes viewed as float8_e4m3
+    bf16_ptr,  # the same bytes viewed as bfloat16 (the rope tail)
+    u8_ptr,  # the same bytes viewed as uint8 (the ue8m0 scale footer)
+    idx_ptr,
+    len_ptr,
+    x_fp8_ptr,  # second pool, same three views; unused when not HAS_EXTRA
+    x_bf16_ptr,
+    x_u8_ptr,
+    x_idx_ptr,
+    x_len_ptr,
+    o_ptr,
+    sink_ptr,  # [H] fp32 learned per-head sink logit; unused when not HAS_SINK
+    sm_scale,
+    topk,
+    x_topk,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_NOPE: tl.constexpr,  # fp8 half of a row (448)
+    D_ROPE: tl.constexpr,  # bf16 tail (64); the head is D_NOPE + D_ROPE
+    SCALE_TILE: tl.constexpr,  # fp8 values per ue8m0 byte (64)
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    X_PAGE_SIZE: tl.constexpr,
+    X_BYTES_PER_PAGE: tl.constexpr,
+    X_S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    IDX64: tl.constexpr,
+    QK_SCALED: tl.constexpr,
+    PV_ROWMAX: tl.constexpr,
+    ABL_LOAD: tl.constexpr,
+    ABL_DOT: tl.constexpr,
+):
+    t = tl.program_id(0)
+    D: tl.constexpr = D_NOPE + D_ROPE
+
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
+    col = tl.arange(0, SCALE_TILE)  # lanes within one fp8 chunk
+    rcol = tl.arange(0, D_ROPE)  # lanes within the bf16 rope tail
+    n = tl.arange(0, BLOCK_N)
+    qb = q_ptr + t * H * D + h[:, None] * D
+
+    # ---- Q, quantised once per program ------------------------------------
+    # Per (row, chunk) amax: one reduction per chunk, outside the k loop, and
+    # strictly tighter than a single row scale over all 448 dims. sm_scale and
+    # the fp8 dequant both fold into the returned logit scale.
+    q0, s0 = _q_chunk(qb, hmask, col, sm_scale, 0, SCALE_TILE)
+    q1, s1 = _q_chunk(qb, hmask, col, sm_scale, 1, SCALE_TILE)
+    q2, s2 = _q_chunk(qb, hmask, col, sm_scale, 2, SCALE_TILE)
+    q3, s3 = _q_chunk(qb, hmask, col, sm_scale, 3, SCALE_TILE)
+    q4, s4 = _q_chunk(qb, hmask, col, sm_scale, 4, SCALE_TILE)
+    q5, s5 = _q_chunk(qb, hmask, col, sm_scale, 5, SCALE_TILE)
+    q6, s6 = _q_chunk(qb, hmask, col, sm_scale, 6, SCALE_TILE)
+    q_rope = tl.load(qb + D_NOPE + rcol[None, :], mask=hmask[:, None], other=0.0)
+
+    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_H], tl.float32)
+    a0 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a1 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a2 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a3 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a4 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a5 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a6 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    ar = tl.zeros([BLOCK_H, D_ROPE], tl.float32)
+
+    k_len = tl.load(len_ptr + t)
+    for k0 in tl.range(0, k_len, BLOCK_N):
+        idx = tl.load(idx_ptr + t * topk + k0 + n, mask=(k0 + n) < k_len, other=-1)
+        m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar = _native_tile(
+            m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar,
+            q0, q1, q2, q3, q4, q5, q6,
+            s0, s1, s2, s3, s4, s5, s6,
+            q_rope,
+            fp8_ptr, bf16_ptr, u8_ptr, idx, col, rcol, sm_scale,
+            BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, D_NOPE=D_NOPE,
+            SCALE_TILE=SCALE_TILE, PAGE_SIZE=PAGE_SIZE,
+            BYTES_PER_PAGE=BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+            SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+            S_OFFSET_BYTES=S_OFFSET_BYTES, IDX64=IDX64,
+            QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX,
+            ABL_LOAD=ABL_LOAD, ABL_DOT=ABL_DOT,
+        )
+
+    if HAS_EXTRA:
+        # Online softmax is associative over the concatenation, so the second
+        # pool just continues the same running (m, l, acc). DSv4 passes the
+        # sliding window here and the compressed cache in the first pool.
+        x_len = tl.load(x_len_ptr + t)
+        for k0 in tl.range(0, x_len, BLOCK_N):
+            idx = tl.load(
+                x_idx_ptr + t * x_topk + k0 + n, mask=(k0 + n) < x_len, other=-1
+            )
+            m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar = _native_tile(
+                m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar,
+                q0, q1, q2, q3, q4, q5, q6,
+                s0, s1, s2, s3, s4, s5, s6,
+                q_rope,
+                x_fp8_ptr, x_bf16_ptr, x_u8_ptr, idx, col, rcol, sm_scale,
+                BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, D_NOPE=D_NOPE,
+                SCALE_TILE=SCALE_TILE, PAGE_SIZE=X_PAGE_SIZE,
+                BYTES_PER_PAGE=X_BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+                SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+                S_OFFSET_BYTES=X_S_OFFSET_BYTES, IDX64=IDX64,
+                QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX,
+            ABL_LOAD=ABL_LOAD, ABL_DOT=ABL_DOT,
+            )
+
+    if HAS_SINK:
+        # A raw logit (already in natural-log space, not scaled by sm_scale)
+        # that joins the denominator without contributing a value row. acc and
+        # l_i are both held at m_base, so rescaling the pair to a combined max
+        # leaves acc/l_i unchanged while keeping exp(sink - base) from
+        # overflowing when every logit is far below sink.
+        sink = tl.load(sink_ptr + h, mask=hmask, other=-float("inf")).to(tl.float32)
+        m_base = tl.where(m_i == -float("inf"), 0.0, m_i)
+        m_comb = tl.maximum(m_base, sink)
+        rescale = tl.exp(m_base - m_comb)
+        l_i = l_i * rescale + tl.exp(sink - m_comb)
+        a0 = a0 * rescale[:, None]
+        a1 = a1 * rescale[:, None]
+        a2 = a2 * rescale[:, None]
+        a3 = a3 * rescale[:, None]
+        a4 = a4 * rescale[:, None]
+        a5 = a5 * rescale[:, None]
+        a6 = a6 * rescale[:, None]
+        ar = ar * rescale[:, None]
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    inv = (1.0 / l_safe)[:, None]
+    ob = o_ptr + t * H * D + h[:, None] * D
+    ot = o_ptr.dtype.element_ty
+    tl.store(ob + 0 * SCALE_TILE + col[None, :], (a0 * inv).to(ot), mask=hmask[:, None])
+    tl.store(ob + 1 * SCALE_TILE + col[None, :], (a1 * inv).to(ot), mask=hmask[:, None])
+    tl.store(ob + 2 * SCALE_TILE + col[None, :], (a2 * inv).to(ot), mask=hmask[:, None])
+    tl.store(ob + 3 * SCALE_TILE + col[None, :], (a3 * inv).to(ot), mask=hmask[:, None])
+    tl.store(ob + 4 * SCALE_TILE + col[None, :], (a4 * inv).to(ot), mask=hmask[:, None])
+    tl.store(ob + 5 * SCALE_TILE + col[None, :], (a5 * inv).to(ot), mask=hmask[:, None])
+    tl.store(ob + 6 * SCALE_TILE + col[None, :], (a6 * inv).to(ot), mask=hmask[:, None])
+    tl.store(
+        ob + D_NOPE + rcol[None, :], (ar * inv).to(ot), mask=hmask[:, None]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Split-K decode over the *native* paged-fp8 gather. VARIANT ADDITION.
+#
+# This is the combination of the two pieces above: the split/merge structure of
+# `_nsa_decode_split_kernel` + `_nsa_decode_merge_kernel` (grid (T,S) then
+# (T,H), unnormalised partials as `acc` + two fp32 planes `m` and `l`, sink
+# folded exactly once in the merge) applied to `_native_tile`, which reads the
+# stored fp8 bytes and their ue8m0 exponents without converting anything.
+#
+# Why it had to be built. The split path's paged-fp8 arm was written against the
+# *old* `_paged_fp8_row_tile` gather, which materialises the KV tile in
+# registers and therefore emits no fp8 mma at all. On that base, splitting
+# reached 1.43x of FlashInfer at B=1 but fell to 0.77x at B=8 and 0.39x at B=64:
+# splitting hid the gather deficit at small batch and could not at large. The
+# native gather is 6.21x faster at prefill on exactly the same bytes, so the
+# question this kernel answers is whether the arm still crosses over, and where.
+#
+# Structural notes, all forced rather than chosen:
+#
+# * **The accumulator is eight named tiles, not one.** DSv4's ue8m0 layout puts
+#   one scale per 64 nope values, and the PV scale varies along the reduction
+#   axis, so P is quantised once per output chunk; the seven chunk accumulators
+#   plus the bf16 rope accumulator therefore cross the k loop as separate
+#   loop-carried values. The merge is unaffected: the eight tiles are stored to
+#   byte offsets 0, 64, ..., 448 of the same 512-wide partial row, which is
+#   exactly the contiguous `mid_o[t, h, s, :]` the merge already reads.
+# * **The split range is over the concatenated tile index**, identical to
+#   `_nsa_decode_split_paged_fp8_kernel`: tiles `[0, ta)` address the first pool
+#   and `[ta, ta+tb)` the second, because the two pools are one candidate list
+#   as far as the softmax is concerned.
+# * **No sink and no normalise here.** Both belong to the merge, once, and that
+#   is what makes S=1 dispatch the unsplit kernel rather than emulate it.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _nsa_decode_split_paged_fp8_native_kernel(
+    q_ptr,
+    fp8_ptr,  # pool bytes viewed as float8_e4m3
+    bf16_ptr,  # the same bytes viewed as bfloat16 (the rope tail)
+    u8_ptr,  # the same bytes viewed as uint8 (the ue8m0 scale footer)
+    idx_ptr,
+    len_ptr,
+    x_fp8_ptr,  # second pool, same three views; unused when not HAS_EXTRA
+    x_bf16_ptr,
+    x_u8_ptr,
+    x_idx_ptr,
+    x_len_ptr,
+    mid_o_ptr,  # [T, H, splits, D] -- unnormalised acc
+    mid_m_ptr,  # [T, H, splits] fp32 -- running max, -inf for an empty split
+    mid_l_ptr,  # [T, H, splits] fp32 -- running denominator, 0 when empty
+    sm_scale,
+    topk,
+    x_topk,
+    splits,  # runtime, not constexpr: one compilation serves every batch size
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    SCALE_TILE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    X_PAGE_SIZE: tl.constexpr,
+    X_BYTES_PER_PAGE: tl.constexpr,
+    X_S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    IDX64: tl.constexpr,
+    QK_SCALED: tl.constexpr,
+    PV_ROWMAX: tl.constexpr,
+):
+    """`_nsa_prefill_paged_fp8_native_kernel`'s loop over a slice of the
+    concatenated candidate list. Same body, different bounds, no epilogue."""
+    t = tl.program_id(0)
+    s = tl.program_id(1)
+    D: tl.constexpr = D_NOPE + D_ROPE
+
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
+    col = tl.arange(0, SCALE_TILE)  # lanes within one fp8 chunk
+    rcol = tl.arange(0, D_ROPE)  # lanes within the bf16 rope tail
+    n = tl.arange(0, BLOCK_N)
+    qb = q_ptr + t * H * D + h[:, None] * D
+
+    # Q is quantised once per program, exactly as in the unsplit kernel. Every
+    # split re-pays it; at DSv4's 7 chunks of 64 that is 7 reductions over a
+    # [BLOCK_H, 64] tile, which is what `_MIN_CHUNKS_*` has to amortise.
+    q0, s0 = _q_chunk(qb, hmask, col, sm_scale, 0, SCALE_TILE)
+    q1, s1 = _q_chunk(qb, hmask, col, sm_scale, 1, SCALE_TILE)
+    q2, s2 = _q_chunk(qb, hmask, col, sm_scale, 2, SCALE_TILE)
+    q3, s3 = _q_chunk(qb, hmask, col, sm_scale, 3, SCALE_TILE)
+    q4, s4 = _q_chunk(qb, hmask, col, sm_scale, 4, SCALE_TILE)
+    q5, s5 = _q_chunk(qb, hmask, col, sm_scale, 5, SCALE_TILE)
+    q6, s6 = _q_chunk(qb, hmask, col, sm_scale, 6, SCALE_TILE)
+    q_rope = tl.load(qb + D_NOPE + rcol[None, :], mask=hmask[:, None], other=0.0)
+
+    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_H], tl.float32)
+    a0 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a1 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a2 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a3 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a4 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a5 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    a6 = tl.zeros([BLOCK_H, SCALE_TILE], tl.float32)
+    ar = tl.zeros([BLOCK_H, D_ROPE], tl.float32)
+
+    # Split over the concatenation of the two pools; see
+    # `_nsa_decode_split_paged_fp8_kernel` for why the split axis cannot be
+    # per-pool.
+    k_len = tl.load(len_ptr + t)
+    ta = tl.cdiv(k_len, BLOCK_N)
+    if HAS_EXTRA:
+        x_len = tl.load(x_len_ptr + t)
+        tb = tl.cdiv(x_len, BLOCK_N)
+    else:
+        x_len = 0
+        tb = 0
+    c_tiles = tl.cdiv(ta + tb, splits)
+    tlo = s * c_tiles
+    thi = tl.minimum(tlo + c_tiles, ta + tb)
+
+    a_lo = tl.minimum(tlo, ta) * BLOCK_N
+    a_hi = tl.minimum(tl.minimum(thi, ta) * BLOCK_N, k_len)
+    for k0 in tl.range(a_lo, a_hi, BLOCK_N):
+        idx = tl.load(idx_ptr + t * topk + k0 + n, mask=(k0 + n) < a_hi, other=-1)
+        m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar = _native_tile(
+            m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar,
+            q0, q1, q2, q3, q4, q5, q6,
+            s0, s1, s2, s3, s4, s5, s6,
+            q_rope,
+            fp8_ptr, bf16_ptr, u8_ptr, idx, col, rcol, sm_scale,
+            BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, D_NOPE=D_NOPE,
+            SCALE_TILE=SCALE_TILE, PAGE_SIZE=PAGE_SIZE,
+            BYTES_PER_PAGE=BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+            SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+            S_OFFSET_BYTES=S_OFFSET_BYTES, IDX64=IDX64,
+            QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX,
+            ABL_LOAD=False, ABL_DOT=False,
+        )
+
+    if HAS_EXTRA:
+        b_lo = tl.maximum(tlo - ta, 0) * BLOCK_N
+        b_hi = tl.minimum(tl.maximum(thi - ta, 0) * BLOCK_N, x_len)
+        for k0 in tl.range(b_lo, b_hi, BLOCK_N):
+            idx = tl.load(
+                x_idx_ptr + t * x_topk + k0 + n, mask=(k0 + n) < b_hi, other=-1
+            )
+            m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar = _native_tile(
+                m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar,
+                q0, q1, q2, q3, q4, q5, q6,
+                s0, s1, s2, s3, s4, s5, s6,
+                q_rope,
+                x_fp8_ptr, x_bf16_ptr, x_u8_ptr, idx, col, rcol, sm_scale,
+                BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, D_NOPE=D_NOPE,
+                SCALE_TILE=SCALE_TILE, PAGE_SIZE=X_PAGE_SIZE,
+                BYTES_PER_PAGE=X_BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+                SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+                S_OFFSET_BYTES=X_S_OFFSET_BYTES, IDX64=IDX64,
+                QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX,
+                ABL_LOAD=False, ABL_DOT=False,
+            )
+
+    # The eight accumulators tile the 512-wide partial row exactly, so the merge
+    # reads them back as one contiguous `mid_o[t, h, s, :]` and needs no change.
+    mbase = ((t * H + h).to(tl.int64) * splits) + s
+    tl.store(mid_m_ptr + mbase, m_i, mask=hmask)
+    tl.store(mid_l_ptr + mbase, l_i, mask=hmask)
+    ob = mid_o_ptr + mbase[:, None] * D
+    ot = mid_o_ptr.dtype.element_ty
+    tl.store(ob + 0 * SCALE_TILE + col[None, :], a0.to(ot), mask=hmask[:, None])
+    tl.store(ob + 1 * SCALE_TILE + col[None, :], a1.to(ot), mask=hmask[:, None])
+    tl.store(ob + 2 * SCALE_TILE + col[None, :], a2.to(ot), mask=hmask[:, None])
+    tl.store(ob + 3 * SCALE_TILE + col[None, :], a3.to(ot), mask=hmask[:, None])
+    tl.store(ob + 4 * SCALE_TILE + col[None, :], a4.to(ot), mask=hmask[:, None])
+    tl.store(ob + 5 * SCALE_TILE + col[None, :], a5.to(ot), mask=hmask[:, None])
+    tl.store(ob + 6 * SCALE_TILE + col[None, :], a6.to(ot), mask=hmask[:, None])
+    tl.store(ob + D_NOPE + rcol[None, :], ar.to(ot), mask=hmask[:, None])
+
+
+# Split-count and tile policy for the native paged-fp8 arm. Everything this
+# combination inherits was measured against a different kernel, so all of it was
+# re-measured here (probe_splitk_native.py, job 3595646, RTX 5080 / sm_120 / 84
+# SMs, CUDA-graph replay, DSv4 decode shape h=8 d=512 swa 128 + c4 512):
+#
+# * **The tile does carry over -- but that had to be checked.** A's
+#   `(BLOCK_N, warps, stages, BLOCK_H)` was swept at *prefill*, T=4096, where the
+#   grid alone fills the device; at decode BLOCK_N additionally fixes how finely
+#   the candidate list can be split (640 candidates are 20 tiles at 32, 10 at
+#   64, 5 at 128). Re-swept over 3x2x2 tiles at B in {1, 8, 64}, taking the best
+#   S in each cell, (64, 4, 2) at BLOCK_H=8 wins again -- gmean 0.0151 ms
+#   against 0.0154 for (32, 4, 2), 0.0168 for (64, 8, 2) and 0.0210 for
+#   (128, 4, 2). The finer split BLOCK_N=32 buys (S up to 20) does not pay for
+#   the doubled per-tile overhead. BLOCK_H 8 beats 16 only at B=64 (0.0328 vs
+#   0.0349) and ties below.
+#   Note this is NOT the module's `_config` tile: `_PINNED_NARROW_H` gives
+#   (32, 4, 3) for h <= 8, which was swept for the *bf16* kernel and costs this
+#   one 1.48x unsplit (0.0635 vs 0.0430 ms) -- so the native arm pins its own.
+# * **`_MAX_WAVES` does not carry over: 4 -> 1.** It was fitted against the old
+#   gather. Scoring the heuristic as the geometric mean over B of
+#   `t[auto S] / t[best S]` on the dense S sweep: (min_chunks, max_waves) =
+#   (1, 1) scores 1.008, (1, 3) 1.013, and B's own (1, 4) 1.033. A ~6x cheaper
+#   gather makes a split's fixed cost relatively larger, so the point at which
+#   more programs stop paying arrives a wave earlier.
+# * **`_MIN_CHUNKS` does carry over at 1**, and the surface is steep about it:
+#   min_chunks 2 scores 1.137, 3 scores 1.615, 4 scores 1.801. One BLOCK_N=64
+#   tile per split still amortises the split's fixed cost (a 7-chunk Q
+#   quantisation, an epilogue and a 512-wide partial write).
+_NATIVE_TILE = (64, 4, 2)  # (BLOCK_N, warps, stages); None -> `_config`
+_NATIVE_BLOCK_H = 8  # rows of the head mma tile; None -> `_block_h`
+_MIN_CHUNKS_NATIVE = 1  # tiles per split below which a split does not pay
+_MAX_WAVES_NATIVE = 1  # waves of `_BLOCKS_PER_SM` blocks before splitting loses
+
+# What the last launch of each native arm actually ran, after `_smem_fallbacks`
+# has had its say. Host-side only, so it costs nothing on the device and nothing
+# inside a captured graph; it exists so that a tile sweep can tell a config that
+# ran from one that silently stepped down to a smaller tile.
+_LAUNCH_INFO = {}
+
+
+def _native_config(device, num_heads):
+    """The tile for the native fp8 arm, split or not.
+
+    `_config` is the *bf16* kernel's pinned tile and is 1.48x slower here, so
+    this arm carries its own. Falls back to `_config` on any device for which
+    `_NATIVE_TILE` has not been swept.
+    """
+    bn, warps, stages = _NATIVE_TILE or _config(device, num_heads)
+    # 8-bit operands need K >= 32 (`min_dot_size`), and BLOCK_N is the reduction
+    # extent of the PV dot, so a narrower tile would not compile.
+    return max(32, bn), warps, stages
+
+
+def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile):
+    """Three aliased flat views of one pool, plus its byte strides.
+
+    Page interior is ``[P x row_bytes data][P x scale_bytes footer]``; a row is
+    ``d_nope`` fp8 bytes then ``d_rope`` bf16 (DSv4: 448 + 128 = 576 B), and the
+    per-token scale slot is padded to a power of two (7 scales in 8 B). Indices
+    are absolute token ids into a contiguous pool -- there is no page table.
+    """
+    u8 = cache.view(torch.uint8)
+    assert u8.is_contiguous(), "the paged cache must be contiguous"
+    row_bytes = d_nope + d_rope * 2
+    return (
+        u8.view(_FP8_DTYPE).reshape(-1),
+        u8.view(torch.bfloat16).reshape(-1),
+        u8.reshape(-1),
+        u8.shape[-1],  # bytes per page
+        row_bytes,
+        triton.next_power_of_2(d_nope // scale_tile),
+        page_size * row_bytes,  # start of the page's scale footer
+    )
+
+
+def sparse_mla_prefill_paged_fp8_native(
+    q,
+    quant_k_cache,
+    indices,
+    sm_scale,
+    page_size,
+    *,
+    extra_cache=None,
+    extra_indices=None,
+    extra_page_size=None,
+    extra_topk_length=None,
+    d_nope=448,
+    d_rope=64,
+    scale_tile=64,
+    attn_sink=None,
+    topk_length=None,
+    out=None,
+    config=None,
+    block_h=None,
+    int64_indexing=None,
+    qk_scaled=False,
+    pv_rowmax=True,
+    splits=1,
+    partial_dtype=torch.bfloat16,
+    _abl_load=False,
+    _abl_dot=False,
+):
+    """Sparse-MLA prefill read straight off one or two paged fp8 KV pools.
+
+    Consumes the stored fp8 bytes and the stored ue8m0 exponents directly, so
+    the KV side contributes no quantisation error beyond what the cache already
+    holds. Only Q is quantised (per row per 64-wide chunk).
+
+    Args:
+        q: ``[T, H, d_nope + d_rope]`` bf16.
+        quant_k_cache: ``[num_pages, bytes_per_page]``, any dtype, read as bytes.
+        indices: ``[T, topk]`` int32 absolute token ids; ``-1`` marks an empty
+            slot.
+        page_size: tokens per page of ``quant_k_cache``.
+        extra_cache / extra_indices / extra_page_size: an optional second pool
+            attended in the same softmax -- DSv4's compressed cache, which has
+            its own page size.
+        d_nope / d_rope: fp8 and bf16 halves of a row.
+        scale_tile: fp8 values covered by one ue8m0 scale byte.
+        attn_sink: optional ``[H]`` fp32 per-head sink logit.
+        splits: candidate-list splits per query token, for decode. ``1``
+            (default) runs ``_nsa_prefill_paged_fp8_native_kernel`` on grid
+            ``(T,)``, bit for bit the kernel ``tsmp_paged_native.py`` ships on
+            the same tile -- no partials, no merge.
+            ``"auto"`` picks a count with ``auto_splits``
+            under this arm's own ``_MIN_CHUNKS_NATIVE`` / ``_MAX_WAVES_NATIVE``.
+            Anything above 1 runs
+            ``_nsa_decode_split_paged_fp8_native_kernel`` on grid
+            ``(T, splits)`` plus ``_nsa_decode_merge_kernel`` on ``(T, H)``;
+            algebraically identical, not bitwise, because the softmax is
+            reassociated and the partials round to ``partial_dtype``.
+        partial_dtype: element type of the ``[T, H, splits, D]`` partial output.
+    """
+    if not _has_fp8_mma(q.device):
+        cap = torch.cuda.get_device_capability(q.device)
+        raise RuntimeError(
+            f"sm_{cap[0]}{cap[1]} has no native e4m3 mma "
+            f"(supported: {sorted(_FP8_MMA_CAPS)}). sm_121 in particular "
+            "upcasts fp8, which makes this path slower than the bf16 one."
+        )
+
+    if indices.dim() == 3:
+        assert indices.shape[1] == 1
+        indices = indices.squeeze(1)
+    if extra_indices is not None and extra_indices.dim() == 3:
+        assert extra_indices.shape[1] == 1
+        extra_indices = extra_indices.squeeze(1)
+
+    T, h, d_qk = q.shape
+    D = d_nope + d_rope
+    if d_qk != D:
+        raise ValueError(
+            f"q is {d_qk} wide but a cache row is {D} ({d_nope} + {d_rope})."
+        )
+    if d_nope % scale_tile:
+        raise ValueError(
+            f"d_nope {d_nope} must be a multiple of scale_tile {scale_tile}."
+        )
+    # The kernel carries one accumulator per scale chunk as a named value, so
+    # the chunk count is fixed at DSv4's 7 rather than being a free parameter.
+    if d_nope // scale_tile != 7:
+        raise ValueError(
+            f"this kernel is specialised to 7 scale chunks (DSv4's 448/64); got "
+            f"{d_nope // scale_tile} from d_nope={d_nope}, "
+            f"scale_tile={scale_tile}."
+        )
+
+    fp8_p, bf16_p, u8_p, bpp, row_bytes, sbpt, s_off = _paged_fp8_layout(
+        quant_k_cache, page_size, d_nope, d_rope, scale_tile
+    )
+    has_extra = extra_cache is not None
+    if has_extra:
+        if extra_indices is None or extra_page_size is None:
+            raise ValueError(
+                "extra_cache needs extra_indices and extra_page_size as well."
+            )
+        x_fp8, x_bf16, x_u8, x_bpp, _, _, x_s_off = _paged_fp8_layout(
+            extra_cache, extra_page_size, d_nope, d_rope, scale_tile
+        )
+        extra_indices = extra_indices.contiguous()
+        if extra_topk_length is None:
+            extra_topk_length = _topk_length(extra_indices, extra_indices.shape[-1])
+        x_topk = extra_indices.shape[-1]
+    else:
+        x_fp8, x_bf16, x_u8 = fp8_p, bf16_p, u8_p
+        x_bpp, x_s_off, x_topk = bpp, s_off, 1
+        extra_indices = indices
+        extra_topk_length = None
+
+    indices = indices.contiguous()
+    if out is None:
+        out = torch.empty(T, h, D, dtype=torch.bfloat16, device=q.device)
+    if topk_length is None:
+        topk_length = _topk_length(indices, indices.shape[-1])
+    if extra_topk_length is None:
+        extra_topk_length = topk_length
+    if attn_sink is not None:
+        if attn_sink.shape != (h,):
+            raise ValueError(f"attn_sink must be [{h}]; got {tuple(attn_sink.shape)}.")
+        attn_sink = attn_sink.to(torch.float32).contiguous()
+
+    # One tile for both paths, so that `splits=1` and `splits>1` are the same
+    # kernel body on the same tile and the only difference is the loop bounds
+    # and the epilogue. `splits` is resolved after, because `auto_splits` needs
+    # the tile the split kernel will actually run.
+    if config is not None:
+        # 8-bit operands need K >= 32 (`min_dot_size`), and BLOCK_N is the
+        # reduction extent of the PV dot, so a narrower tile would not compile.
+        bn, warps, stages = config
+        bn = max(32, bn)
+    else:
+        bn, warps, stages = _native_config(q.device, h)
+    block_h = block_h or _NATIVE_BLOCK_H or _block_h(q.device, h)
+    # Byte offsets, not element offsets: a pool is `num_pages * bytes_per_page`
+    # bytes, so int32 addressing holds only for pools under 2 GiB.
+    if int64_indexing is None:
+        nbytes = max(
+            quant_k_cache.numel() * quant_k_cache.element_size(),
+            (extra_cache.numel() * extra_cache.element_size()) if has_extra else 0,
+        )
+        idx64 = nbytes > (2**31 - 1)
+    else:
+        idx64 = bool(int64_indexing)
+
+    if splits == "auto":
+        splits = auto_splits(
+            q.device, T, h, indices.shape[-1] + (x_topk if has_extra else 0),
+            bn, block_h, min_chunks=_MIN_CHUNKS_NATIVE,
+            max_waves=_MAX_WAVES_NATIVE,
+        )
+    splits = int(splits)
+    if splits > 1:
+        # Decode split-K over the concatenation of the two pools. See
+        # `_nsa_decode_split_paged_fp8_native_kernel`. `splits <= 1` leaves the
+        # path below bit for bit unchanged.
+        mid_o, mid_m, mid_l = _split_ws(q.device, T, h, splits, D, partial_dtype)
+        for bn_try, ns_try in _smem_fallbacks(bn, stages):
+            if bn_try < 32:
+                continue
+            try:
+                _nsa_decode_split_paged_fp8_native_kernel[(T, splits)](
+                    q, fp8_p, bf16_p, u8_p, indices, topk_length,
+                    x_fp8, x_bf16, x_u8, extra_indices, extra_topk_length,
+                    mid_o, mid_m, mid_l,
+                    sm_scale,
+                    indices.shape[-1],
+                    x_topk,
+                    splits,
+                    H=h,
+                    BLOCK_H=block_h,
+                    D_NOPE=d_nope,
+                    D_ROPE=d_rope,
+                    SCALE_TILE=scale_tile,
+                    PAGE_SIZE=page_size,
+                    BYTES_PER_PAGE=bpp,
+                    ROW_BYTES=row_bytes,
+                    SCALE_BYTES_PER_TOKEN=sbpt,
+                    S_OFFSET_BYTES=s_off,
+                    X_PAGE_SIZE=extra_page_size or page_size,
+                    X_BYTES_PER_PAGE=x_bpp,
+                    X_S_OFFSET_BYTES=x_s_off,
+                    BLOCK_N=bn_try,
+                    num_warps=warps,
+                    num_stages=ns_try,
+                    HAS_EXTRA=has_extra,
+                    IDX64=idx64,
+                    QK_SCALED=bool(qk_scaled),
+                    PV_ROWMAX=bool(pv_rowmax),
+                )
+                _LAUNCH_INFO["native_split"] = (bn_try, warps, ns_try, block_h)
+                break
+            except triton.runtime.errors.OutOfResources:
+                continue
+        else:
+            raise triton.runtime.errors.OutOfResources(
+                0, 0, "shared memory: no fallback config fits this device/shape"
+            )
+        _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, D, splits)
+        return out
+
+    for bn_try, ns_try in _smem_fallbacks(bn, stages):
+        if bn_try < 32:
+            continue
+        try:
+            _nsa_prefill_paged_fp8_native_kernel[(T,)](
+                q,
+                fp8_p,
+                bf16_p,
+                u8_p,
+                indices,
+                topk_length,
+                x_fp8,
+                x_bf16,
+                x_u8,
+                extra_indices,
+                extra_topk_length,
+                out,
+                attn_sink if attn_sink is not None else topk_length,
+                sm_scale,
+                indices.shape[-1],
+                x_topk,
+                H=h,
+                BLOCK_H=block_h,
+                D_NOPE=d_nope,
+                D_ROPE=d_rope,
+                SCALE_TILE=scale_tile,
+                PAGE_SIZE=page_size,
+                BYTES_PER_PAGE=bpp,
+                ROW_BYTES=row_bytes,
+                SCALE_BYTES_PER_TOKEN=sbpt,
+                S_OFFSET_BYTES=s_off,
+                X_PAGE_SIZE=extra_page_size or page_size,
+                X_BYTES_PER_PAGE=x_bpp,
+                X_S_OFFSET_BYTES=x_s_off,
+                BLOCK_N=bn_try,
+                num_warps=warps,
+                num_stages=ns_try,
+                HAS_EXTRA=has_extra,
+                HAS_SINK=attn_sink is not None,
+                IDX64=idx64,
+                QK_SCALED=bool(qk_scaled),
+                PV_ROWMAX=bool(pv_rowmax),
+                ABL_LOAD=bool(_abl_load),
+                ABL_DOT=bool(_abl_dot),
+            )
+            _LAUNCH_INFO["native_unsplit"] = (bn_try, warps, ns_try, block_h)
             return out
         except triton.runtime.errors.OutOfResources:
             continue
