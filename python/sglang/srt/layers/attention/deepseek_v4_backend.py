@@ -1922,6 +1922,12 @@ class DeepseekV4AttnBackend(
             # which costs one device-to-host read and cannot be graph-captured.
             # Fall back to the per-token path under capture: same result.
             union = 0 if get_is_capture_mode() else _dsv4_triton_union
+            # The sink is built and cached at the padded head count, but this
+            # route may be handed unpadded q (the Triton kernel needs no head
+            # padding). Its first n_local_heads entries are the real ones, so
+            # trimming to whatever q carries is correct either way.
+            if attn_sink is not None and attn_sink.shape[0] != q_flat.shape[1]:
+                attn_sink = attn_sink[: q_flat.shape[1]].contiguous()
             return sparse_mla_prefill(
                 q_flat,
                 kv,

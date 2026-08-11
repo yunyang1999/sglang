@@ -206,6 +206,30 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+# When the Triton sparse-MLA kernel consumes the prefill query, the head count
+# does not need padding: it pads into a 16-row mma tile rather than into the
+# grid. Read once, like the other capability flags.
+_DSV4_TRITON_SPARSE_PREFILL = envs.SGLANG_DSV4_TRITON_SPARSE_PREFILL.get()
+
+
+def _dsv4_padded_heads(n_local_heads: int, n_heads: int, unpadded: bool) -> int:
+    """Heads to allocate for the attention call.
+
+    FlashMLA's fp8 sparse decode specialises h_q for {64, 128}, and FlashInfer's
+    SM120 sparse-MLA prefill accepts only {16, 32, 64, 128}, so the per-rank
+    count is padded up to reach either. The Triton sparse-MLA kernel has no such
+    requirement, so when *it* is the consumer the padding is pure waste -- at
+    TP8 it is 8 real head rows in 64.
+
+    `unpadded` must be true only where that kernel actually runs. It cannot be
+    made unconditional: on SM120 a decode batch above FlashInfer's
+    `_DECODE_MAX_TOKENS` (64) falls through to its *prefill* entry, which has no
+    heads=8 instantiation and would raise.
+    """
+    if unpadded:
+        return n_local_heads
+    return 64 if n_local_heads <= 64 else n_heads
+
 _MHC_POST_MULT_VALUE = 2.0
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
@@ -635,7 +659,7 @@ class MqaAttentionBase(nn.Module):
         if self._attn_sink_local is None:
             rank = self.attn_tp_rank
             num_heads = self.n_local_heads
-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            padded_num_heads = _dsv4_padded_heads(num_heads, self.n_heads, False)
             sink = self.attn_sink.new_zeros(padded_num_heads)
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
@@ -1273,7 +1297,16 @@ class MQALayer(MqaAttentionBase):
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            # Only the sparse-prefill route hands q to the Triton kernel; the
+            # backend gate for it is the same `is_extend_without_speculative()`
+            # once SGLANG_DSV4_TRITON_SPARSE_PREFILL is set.
+            unpadded_heads = (
+                _DSV4_TRITON_SPARSE_PREFILL
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+            padded_num_heads = _dsv4_padded_heads(
+                self.n_local_heads, self.n_heads, unpadded_heads
+            )
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
