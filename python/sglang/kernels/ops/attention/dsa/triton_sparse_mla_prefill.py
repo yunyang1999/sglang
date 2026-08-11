@@ -121,6 +121,16 @@ shape misses that set on both axes. That is what ``models/deepseek_v4.py``'s
 ``padded_num_heads = 64 if n_local_heads <= 64 else n_heads`` is for: the padding
 is not a tuning choice, it is the only way to make the call legal.
 
+Worth knowing before anyone optimises around this: the gap is in the *dispatch
+table*, not in FlashInfer's kernel. Its own prefill source
+(``csrc/sparse_mla_sm120_prefill.cu``) documents ``NUM_HEADS: 8, 16, 64, 128``
+with "NUM_HEADS < HPB=16 zero-pads + gates". So the kernel handles 8; the
+released Python entry refuses it -- re-checked on the dual-cache DSv4 path with
+the extra pool at the required 584 B/token, in case the single-cache probe had
+simply missed the DSv4 route, and it refuses there too. An upstream instantiation
+for heads=8 would delete SGLang's pad-to-64 outright, which is worth more to
+DeepSeek-V4 on SM120 than anything in this file.
+
 Measured that way -- FlashInfer in production form (8 real heads padded to 64,
 swa 128 + extra 512, page-split included) against this kernel with 8 real heads,
 RTX 5080:
