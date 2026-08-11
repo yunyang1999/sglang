@@ -94,6 +94,61 @@ T=4096, h=8, d_qk=d_v=512, combined topk=640):
   0.98x at 4096, 0.99x at 8192. Leave it off for DSv4; the exact-set guard makes
   enabling it harmless but pointless.
 
+Acceptance measurement, SM120, both precisions, both stages
+------------------------------------------------------------
+RTX 5080, DeepSeek-V4 shape (d=512, swa 128 + c4 512, h=8 after TP8, attn_sink),
+against FlashInfer reached through SGLang's own ``_flash_mla_flashinfer`` with
+the page split included. Our columns charge the per-layer workspace build
+(``prep``) against us. Baseline is FlashInfer's narrowest legal instantiation
+for the stage -- h=16 for prefill (its multi-group kernel refuses 8), h=8 for
+decode (its decode dispatch takes 8), so neither side is padded at decode.
+
+    prefill   fi h=64   fi h=16   ours bf16   ours fp8   prep    bf16    fp8
+    T=512      0.931     0.313      0.179      0.147    0.026   1.52x  1.80x
+    T=2048     3.480     1.216      0.619      0.506    0.026   1.89x  2.28x
+    T=4096     6.928     2.390      1.235      1.016    0.027   1.90x  2.29x
+    T=8192    13.651     4.746      2.454      2.017    0.027   1.91x  2.32x
+
+    decode    fi h=64   fi h=8    ours bf16   ours fp8   prep    bf16    fp8
+    B=1        0.125     0.124      0.0396     0.0311   0.026   1.88x  2.15x
+    B=8        0.126     0.124      0.0394     0.0308   0.026   1.89x  2.17x
+    B=32       0.130     0.128      0.0398     0.0310   0.026   1.93x  2.22x
+    B=64       0.374     0.124      0.0413     0.0315   0.026   1.83x  2.14x
+
+Accuracy, against an fp32 oracle over the values the KV cache actually holds --
+production stores fp8 and both kernels read it, so that is the only reference
+under which "no accuracy impact" means anything:
+
+                    prefill      decode
+    ours bf16      0.9999980   0.9999979
+    FlashInfer     0.9998678   0.9995651
+    ours fp8       0.9994601   0.9994475
+
+The bf16 path is roughly 7x *more* accurate than FlashInfer (1.3e-6 against
+1.3e-4). The fp8 path is somewhat less accurate than FlashInfer's (5.4e-4), and
+the reason is structural rather than inherent: it re-quantises with a global
+amax a tensor that was already fp8-derived, i.e. it quantises twice, where
+FlashInfer consumes the stored fp8 and its ue8m0 scales directly. Reading the
+paged cache natively removes that second quantisation entirely.
+
+Two limits on these numbers, stated rather than buried:
+
+* The ``ours`` arms read a flat workspace built from the paged cache. Prefill
+  already has one (``_forward_prefill_sparse`` builds it); **decode does not**,
+  so the decode rows describe a layout the decode path would have to be given.
+  The ``prep`` charge is a whole-pool dequantise, which at decode is far more
+  than the gathered rows would cost -- conservative, not optimistic.
+* Scale granularity is not what limits fp8 here. Measured at this shape, global
+  amax, per-row and per-64 ue8m0 land within 2e-5 of each other against fp32
+  (0.9991758 / 0.9991775 / 0.9991563). The double quantisation is the cost, not
+  the granularity.
+
+Attention subsystem per forward, 43 layers -- a proxy for end to end, because
+DeepSeek-V4 is 150 GB across 8 GPUs and does not fit on any single SM120 part:
+
+    T=4096:  SGLang today 297.9 ms | FI h=16 102.8 | ours bf16 54.2 | fp8 44.8
+    T=8192:  SGLang today 587.0 ms | FI h=16 204.1 | ours bf16 106.7 | fp8 87.9
+
 What it is actually faster than, on DeepSeek-V4 / SM120
 --------------------------------------------------------
 An earlier revision of this note quoted a very large speedup against
