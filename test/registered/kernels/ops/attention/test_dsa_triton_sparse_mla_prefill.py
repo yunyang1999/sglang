@@ -441,3 +441,131 @@ class TestDSATritonPrefillBackendAdapter(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Paged fp8 gather. The oracle is an independent torch decode of the same bytes
+# rather than SGLang's Triton dequantizer, so a shared bug in the byte-layout
+# arithmetic cannot make both sides agree.
+# ---------------------------------------------------------------------------
+
+D_NOPE, D_ROPE, SCALE_TILE = 448, 64, 64
+ROW_BYTES = D_NOPE + D_ROPE * 2  # 576
+SCALE_PER_TOK = 8  # 7 ue8m0 + 1 pad
+
+
+def _bytes_per_page(page_size):
+    per = ROW_BYTES + SCALE_PER_TOK
+    return -(-page_size * per // ROW_BYTES) * ROW_BYTES
+
+
+def _build_paged_fp8_pool(n_tokens, page_size, seed):
+    """A DSv4-layout pool plus the bf16 rows it must decode to.
+
+    Quantization mirrors the pool writer: one ue8m0 exponent per SCALE_TILE nope
+    values chosen so the tile's amax lands inside e4m3 range; rope stored as bf16.
+    """
+    dev = "cuda"
+    g = torch.Generator(device=dev).manual_seed(seed)
+    n_pages = -(-n_tokens // page_size)
+    bpp = _bytes_per_page(page_size)
+    pool = torch.zeros(n_pages, bpp, dtype=torch.uint8, device=dev)
+
+    nope = torch.randn(n_tokens, D_NOPE, dtype=torch.float32, device=dev, generator=g)
+    rope = torch.randn(n_tokens, D_ROPE, dtype=torch.bfloat16, device=dev, generator=g)
+    tiles = nope.view(n_tokens, D_NOPE // SCALE_TILE, SCALE_TILE)
+    exp = torch.ceil(
+        torch.log2(tiles.abs().amax(dim=-1).clamp(min=1e-30) / 448.0)
+    ).clamp(-127, 128)
+    q_fp8 = (tiles / torch.exp2(exp)[:, :, None]).to(torch.float8_e4m3fn)
+    ue8m0 = (exp + 127).to(torch.uint8)
+
+    flat = pool.view(-1)
+    tok = torch.arange(n_tokens, device=dev)
+    data = (tok // page_size) * bpp + (tok % page_size) * ROW_BYTES
+    scal = (tok // page_size) * bpp + page_size * ROW_BYTES + (
+        tok % page_size
+    ) * SCALE_PER_TOK
+    flat[(data[:, None] + torch.arange(D_NOPE, device=dev)[None, :]).reshape(-1)] = (
+        q_fp8.reshape(n_tokens, D_NOPE).view(torch.uint8).reshape(-1)
+    )
+    flat[
+        (data[:, None] + (torch.arange(D_ROPE * 2, device=dev) + D_NOPE)[None, :])
+        .reshape(-1)
+    ] = rope.view(torch.uint8).reshape(-1)
+    flat[
+        (scal[:, None] + torch.arange(D_NOPE // SCALE_TILE, device=dev)[None, :])
+        .reshape(-1)
+    ] = ue8m0.reshape(-1)
+
+    # Independent oracle: what the bytes decode to.
+    decoded_nope = (
+        q_fp8.to(torch.float32) * torch.exp2(exp)[:, :, None]
+    ).reshape(n_tokens, D_NOPE)
+    kv = torch.cat([decoded_nope.to(torch.bfloat16), rope], dim=1)
+    return pool, kv
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestPagedFP8SparseMLAPrefill(CustomTestCase):
+    """The gather-from-the-pool variant, against the bf16 gather of the same rows."""
+
+    def _check(self, got, ref, tag):
+        _assert_matches(self, got, ref, tag, cos_min=0.9999, max_abs=0.02)
+
+    def test_matches_bf16_gather(self):
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            sparse_mla_prefill_paged_fp8,
+        )
+
+        S, PAGE, T, topk = 2048, 256, 512, 640
+        pool, kv = _build_paged_fp8_pool(S, PAGE, seed=11)
+        for h in (8, 16, 64):  # 64 is what DSv4 pads to today
+            with self.subTest(h=h):
+                g = torch.Generator(device="cuda").manual_seed(h)
+                q = torch.randn(
+                    T, h, 512, dtype=torch.bfloat16, device="cuda", generator=g
+                )
+                idx = _random_indices(T, topk, S, g)
+                sink = torch.randn(h, dtype=torch.float32, device="cuda", generator=g)
+                self._check(
+                    sparse_mla_prefill_paged_fp8(
+                        q, pool, idx, SM_SCALE, PAGE, attn_sink=sink
+                    ),
+                    sparse_mla_prefill(q, kv, idx, SM_SCALE, 512, attn_sink=sink),
+                    f"paged fp8 h={h}",
+                )
+
+    def test_two_pools_share_one_softmax(self):
+        # A DSv4 compressed layer attends the sliding window (SWA pool, page 256)
+        # and the selected compressed rows (its own pool, page 64) in one softmax.
+        # Concatenating them first is the materialization this variant avoids, so
+        # the two-source path must equal the concatenated single-source one.
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            sparse_mla_prefill_paged_fp8,
+        )
+
+        S, XS, T, h = 2048, 1024, 512, 8
+        pool, kv = _build_paged_fp8_pool(S, 256, seed=21)
+        xpool, xkv = _build_paged_fp8_pool(XS, 64, seed=22)
+        g = torch.Generator(device="cuda").manual_seed(23)
+        q = torch.randn(T, h, 512, dtype=torch.bfloat16, device="cuda", generator=g)
+        sidx = _random_indices(T, 128, S, g)
+        xidx = _random_indices(T, 512, XS, g)
+        sink = torch.randn(h, dtype=torch.float32, device="cuda", generator=g)
+        ref = sparse_mla_prefill(
+            q,
+            torch.cat([kv, xkv], dim=0),
+            torch.cat([sidx, torch.where(xidx >= 0, xidx + S, xidx)], dim=1),
+            SM_SCALE,
+            512,
+            attn_sink=sink,
+        )
+        self._check(
+            sparse_mla_prefill_paged_fp8(
+                q, pool, sidx, SM_SCALE, 256, extra_cache=xpool,
+                extra_indices=xidx, extra_page_size=64, attn_sink=sink,
+            ),
+            ref,
+            "SWA pool + compressed pool",
+        )

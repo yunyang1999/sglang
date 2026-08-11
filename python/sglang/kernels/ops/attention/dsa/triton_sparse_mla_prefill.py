@@ -90,6 +90,23 @@ T=4096, h=8, d_qk=d_v=512, combined topk=640):
   0.98x at 4096, 0.99x at 8192. Leave it off for DSv4; the exact-set guard makes
   enabling it harmless but pointless.
 
+Where the time actually goes on DeepSeek-V4 / SM120
+---------------------------------------------------
+Measured on RTX 5080 (sm_120, torch 2.11+cu130 / triton 3.6), T=4096, topk=640,
+S=8192 pool rows:
+
+* **Head padding dominates, and it is not an attention-math problem.** DSv4 pads
+  ``q`` from the heads TP actually leaves to 64 before the FlashMLA / FlashInfer
+  entry and slices the output back (``models/deepseek_v4.py``), because that
+  entry needs the head count aligned. Running those 64 padded rows through this
+  kernel costs **7.35x** running the 8 real ones (10.96 ms vs 1.49 ms; 1.02x at
+  h=16, 1.56x at h=32). A per-token kernel pads into a 16-row mma tile instead,
+  so the padding simply does not happen — this is the single largest recoverable
+  item, and it comes from *which kernel is dispatched*, not from tuning one.
+* The fp8 -> bf16 dequant that feeds a gather is not worth removing: 0.0145 ms
+  for the whole 8192-row pool, ~1% of the attention. See the paged-fp8 section
+  below for the attempt and why it lost.
+
 All tunables are explicit arguments — the module reads no environment
 variables. If a tuned tile exceeds the device shared-memory budget (e.g. a
 large head count on SM120's 100 KB), the launcher steps down through smaller
@@ -720,6 +737,8 @@ def _smem_fallbacks(bn, stages):
         (bn // 2, 2),
         (bn // 4, 2),
         (16, 2),
+        (bn // 2, 1),
+        (16, 1),
     ):
         b, ns = max(16, cand[0]), max(1, cand[1])
         if (b, ns) not in seen:
@@ -879,6 +898,408 @@ def sparse_mla_prefill(
             # A larger head count (BLOCK_H) or a smaller smem budget can push the
             # pinned tile over the device limit (e.g. h=32 on SM120's 100 KB).
             # Step down the K tile / pipeline depth instead of failing the request.
+            continue
+    raise triton.runtime.errors.OutOfResources(
+        0, 0, "shared memory: no fallback config fits this device/shape"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Paged FP8 gather (DeepSeek-V4). The kernel above takes a flat bf16 KV block,
+# which on DSv4 only exists because something dequantized the pool into it
+# first. This one gathers straight out of the paged fp8 pools and decodes each
+# row in registers, so that intermediate never has to exist.
+#
+# The idea was that it removes passes rather than instructions: a gathered row
+# costs 584 B here against 584 (read fp8) + 1024 (write bf16) + 1024 (read bf16)
+# for the materialized form. That accounting is right and the conclusion is still
+# wrong -- see the measurement below.
+#
+# Two sources, because that is what a DSv4 layer attends over: the sliding
+# window lives in the SWA pool (page_size 256) and, on compressed layers, the
+# selected rows live in a separate compressed pool at a different page size
+# (64 for compress_ratio 4, 2 for 128). Feeding both to one kernel keeps the
+# online softmax in registers across them -- concatenating them into one buffer
+# first is exactly the materialization this kernel exists to avoid.
+#
+# MEASURED: this is slower than gathering pre-decoded bf16, and is NOT the
+# default. On SM120 (RTX 5080, T=4096, h=8, topk=640, S=8192): the bf16 gather
+# runs 1.487 ms; the best of a 36-config sweep here is 3.465 ms at (BLOCK_N=32,
+# warps=4, stages=1), i.e. 2.33x slower. Tuning recovered half the gap (the
+# pinned stages=2/3 cost 8.2 ms -- the extra staging tiles thrash the pipeline),
+# the rest is structural: it replaces one coalesced 1024-byte row read with three
+# scattered reads of 448 B fp8 + 128 B rope + 8 B scale, and the extra memory
+# instructions and sector waste cost more than the 440 bytes saved.
+#
+# The "the workspace is wasted work" intuition is also wrong for prefill, but not
+# for the reason one expects. Dequantizing the whole pool is nearly free and
+# amortized -- 0.0145 ms for 8192 rows, ~1% of the attention it feeds -- so there
+# is little to win even in principle. (The reuse argument is not the mechanism:
+# the fused form loses by 8-10x at T=1, where each row is gathered less than once,
+# and the ratio *improves* to 5.5x at T=4096. It is a per-access cost, not a
+# repeated-decode cost.)
+#
+# Revive this if any of these change: (a) the gather becomes bandwidth-bound
+# rather than issue-bound (a much larger topk, or an arch where the byte loads
+# vectorize), (b) the pool layout is changed so a row's fp8, rope and scale are
+# one contiguous run, or (c) it is aimed at decode, where T=1 leaves the
+# materialization unamortized and the pool read is the whole cost.
+#
+# It is kept because it is correct and tested, and because it is the only form
+# that needs no dequantized copy at all -- which is what a decode-side or a
+# memory-constrained caller would want.
+#
+# The layout is passed in, so this is "paged fp8 with per-tile ue8m0 block
+# scales and a bf16 tail", not "DeepSeek-V4". DSv4's instance (see
+# kernels/ops/attention/dsv4/dequant_k_cache.py) is:
+#   per token : 448 fp8_e4m3 nope + 64 bf16 rope = 576 contiguous bytes,
+#               plus 7 ue8m0 scale bytes (one per 64 nope values) padded to 8
+#   per page  : [P x 576 data][P x 8 scale], padded up to a multiple of 576
+# ---------------------------------------------------------------------------
+
+_FP8_DTYPE = torch.float8_e4m3fn
+
+
+@triton.jit
+def _paged_fp8_row_tile(
+    fp8_ptr,
+    bf16_ptr,
+    u8_ptr,
+    idx,  # [BLOCK_N] token ids, -1 for empty
+    d,
+    is_nope,
+    rope_col,
+    s_lane,
+    BLOCK_N: tl.constexpr,
+    N_LANES: tl.constexpr,  # D / SCALE_TILE
+    NOPE_LANES: tl.constexpr,  # D_NOPE / SCALE_TILE; lanes past this are padding
+    SCALE_TILE: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+):
+    """Decode BLOCK_N pool rows into one [BLOCK_N, D] bf16 tile."""
+    valid = idx >= 0
+    loc = tl.where(valid, idx, 0).to(tl.int64)
+    page = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    data_base = page * BYTES_PER_PAGE + in_page * ROW_BYTES
+    scale_base = (
+        page * BYTES_PER_PAGE + S_OFFSET_BYTES + in_page * SCALE_BYTES_PER_TOKEN
+    )
+
+    fp8v = tl.load(
+        fp8_ptr + data_base[:, None] + d[None, :],
+        mask=valid[:, None] & is_nope[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    # ue8m0: the byte is a biased power-of-two exponent, so the dequant is an
+    # exp2 scale, not a multiply by a stored float.
+    #
+    # Load the scales at their real width (one byte per SCALE_TILE values, so
+    # [BLOCK_N, D/SCALE_TILE]) and broadcast, rather than gathering a full
+    # [BLOCK_N, D] tile of them. The wide form reads the same 8 bytes per row 64
+    # times over and, more importantly, its pipelined buffers push the tile past
+    # SM120's 100 KB once BLOCK_H reaches 64.
+    sc = tl.load(
+        u8_ptr + scale_base[:, None] + s_lane[None, :],
+        mask=valid[:, None] & (s_lane < NOPE_LANES)[None, :],
+        other=127,
+    ).to(tl.float32)
+    scale = tl.reshape(
+        tl.broadcast_to(tl.exp2(sc - 127.0)[:, :, None], (BLOCK_N, N_LANES, SCALE_TILE)),
+        (BLOCK_N, N_LANES * SCALE_TILE),
+    )
+    nope = fp8v * scale
+
+    rope = tl.load(
+        bf16_ptr + (data_base[:, None] + D_NOPE) // 2 + rope_col[None, :],
+        mask=valid[:, None] & (is_nope[None, :] == 0),
+        other=0.0,
+    )
+    return tl.where(is_nope[None, :], nope.to(tl.bfloat16), rope), valid
+
+
+@triton.jit
+def _nsa_prefill_paged_fp8_kernel(
+    q_ptr,
+    fp8_ptr,  # SWA pool bytes viewed as float8_e4m3
+    bf16_ptr,  # the same bytes viewed as bfloat16 (the rope tail)
+    u8_ptr,  # the same bytes viewed as uint8 (the ue8m0 scales)
+    idx_ptr,
+    len_ptr,
+    x_fp8_ptr,  # compressed pool, same three views; unused when not HAS_EXTRA
+    x_bf16_ptr,
+    x_u8_ptr,
+    x_idx_ptr,
+    x_len_ptr,
+    o_ptr,
+    sink_ptr,
+    sm_scale,
+    topk,
+    x_topk,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D: tl.constexpr,  # full row width = D_NOPE + D_ROPE (512 for DSv4)
+    D_NOPE: tl.constexpr,  # fp8 part; the remainder is the bf16 tail
+    SCALE_TILE: tl.constexpr,  # fp8 values per ue8m0 scale byte (64)
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    X_PAGE_SIZE: tl.constexpr,
+    X_BYTES_PER_PAGE: tl.constexpr,
+    X_S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+):
+    t = tl.program_id(0)
+
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
+    d = tl.arange(0, D)
+    is_nope = d < D_NOPE
+    # Clamped so the masked-off half of each load still forms a legal address.
+    rope_col = tl.where(is_nope, 0, d - D_NOPE)
+    s_lane = tl.arange(0, D // SCALE_TILE)
+
+    # V is the whole row (DSv4 has no separate value projection), so one decoded
+    # tile feeds both dots and each row is touched exactly once.
+    q = tl.load(
+        q_ptr + t * H * D + h[:, None] * D + d[None, :],
+        mask=hmask[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_H], tl.float32)
+    acc = tl.zeros([BLOCK_H, D], tl.float32)
+
+    n = tl.arange(0, BLOCK_N)
+
+    k_len = tl.load(len_ptr + t)
+    for k0 in tl.range(0, k_len, BLOCK_N):
+        idx = tl.load(idx_ptr + t * topk + k0 + n, mask=(k0 + n) < k_len, other=-1)
+        kv, valid = _paged_fp8_row_tile(
+            fp8_ptr, bf16_ptr, u8_ptr, idx, d, is_nope, rope_col, s_lane,
+            BLOCK_N=BLOCK_N, N_LANES=D // SCALE_TILE,
+            NOPE_LANES=D_NOPE // SCALE_TILE, SCALE_TILE=SCALE_TILE,
+            D_NOPE=D_NOPE, PAGE_SIZE=PAGE_SIZE, BYTES_PER_PAGE=BYTES_PER_PAGE,
+            ROW_BYTES=ROW_BYTES, SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+            S_OFFSET_BYTES=S_OFFSET_BYTES,
+        )
+        qk = tl.dot(q, tl.trans(kv)) * sm_scale
+        qk = tl.where(valid[None, :], qk, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(qk - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+
+    if HAS_EXTRA:
+        # Online softmax is associative over the concatenation, so the second
+        # pool just continues the same running (m, l, acc).
+        x_len = tl.load(x_len_ptr + t)
+        for k0 in tl.range(0, x_len, BLOCK_N):
+            idx = tl.load(
+                x_idx_ptr + t * x_topk + k0 + n, mask=(k0 + n) < x_len, other=-1
+            )
+            kv, valid = _paged_fp8_row_tile(
+                x_fp8_ptr, x_bf16_ptr, x_u8_ptr, idx, d, is_nope, rope_col,
+                s_lane,
+                BLOCK_N=BLOCK_N, N_LANES=D // SCALE_TILE,
+                NOPE_LANES=D_NOPE // SCALE_TILE, SCALE_TILE=SCALE_TILE,
+                D_NOPE=D_NOPE, PAGE_SIZE=X_PAGE_SIZE,
+                BYTES_PER_PAGE=X_BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+                SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+                S_OFFSET_BYTES=X_S_OFFSET_BYTES,
+            )
+            qk = tl.dot(q, tl.trans(kv)) * sm_scale
+            qk = tl.where(valid[None, :], qk, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+            m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+            alpha = tl.exp(m_i - m_safe)
+            p = tl.exp(qk - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+            m_i = m_new
+
+    if HAS_SINK:
+        sink = tl.load(sink_ptr + h, mask=hmask, other=-float("inf")).to(tl.float32)
+        m_base = tl.where(m_i == -float("inf"), 0.0, m_i)
+        m_comb = tl.maximum(m_base, sink)
+        rescale = tl.exp(m_base - m_comb)
+        l_i = l_i * rescale + tl.exp(sink - m_comb)
+        acc = acc * rescale[:, None]
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe[:, None]
+    tl.store(
+        o_ptr + t * H * D + h[:, None] * D + d[None, :],
+        acc.to(o_ptr.dtype.element_ty),
+        mask=hmask[:, None],
+    )
+
+
+def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile):
+    u8 = cache.view(torch.uint8)
+    assert u8.is_contiguous(), "the paged cache must be contiguous"
+    row_bytes = d_nope + d_rope * 2
+    return (
+        u8.view(_FP8_DTYPE).reshape(-1),
+        u8.view(torch.bfloat16).reshape(-1),
+        u8.reshape(-1),
+        u8.shape[-1],  # bytes per page
+        row_bytes,
+        # The pool pads the per-token scale stride to a power of two (DSv4: 7
+        # scales in an 8-byte slot).
+        triton.next_power_of_2(d_nope // scale_tile),
+        page_size * row_bytes,  # start of the page's scale footer
+    )
+
+
+def sparse_mla_prefill_paged_fp8(
+    q,
+    quant_k_cache,
+    indices,
+    sm_scale,
+    page_size,
+    *,
+    extra_cache=None,
+    extra_indices=None,
+    extra_page_size=None,
+    extra_topk_length=None,
+    d_nope=448,
+    d_rope=64,
+    scale_tile=64,
+    attn_sink=None,
+    topk_length=None,
+    out=None,
+    config=None,
+):
+    """Sparse-MLA prefill read straight off one or two paged fp8 KV pools.
+
+    Same contract as ``sparse_mla_prefill`` except that ``indices`` are token ids
+    into a pool rather than rows of a pre-gathered block, so no dequantized copy
+    is needed anywhere.
+
+    Args:
+        q: ``[T, H, d_nope + d_rope]`` bf16.
+        quant_k_cache: ``[num_pages, bytes_per_page]``, any dtype, read as bytes.
+        indices: ``[T, topk]`` int32 token ids; ``-1`` marks an empty slot.
+        page_size: tokens per page of ``quant_k_cache``.
+        extra_cache / extra_indices / extra_page_size: an optional second pool
+            attended in the same softmax — DSv4's compressed cache, which has its
+            own page size (64 at compress_ratio 4, 2 at 128).
+        d_nope / d_rope: fp8 and bf16 halves of a row.
+        scale_tile: fp8 values covered by one ue8m0 scale byte.
+        attn_sink: optional ``[H]`` fp32 per-head sink logit.
+    """
+    if indices.dim() == 3:
+        assert indices.shape[1] == 1
+        indices = indices.squeeze(1)
+    if extra_indices is not None and extra_indices.dim() == 3:
+        assert extra_indices.shape[1] == 1
+        extra_indices = extra_indices.squeeze(1)
+
+    T, h, d_qk = q.shape
+    D = d_nope + d_rope
+    if d_qk != D:
+        raise ValueError(
+            f"q is {d_qk} wide but a cache row is {D} ({d_nope} + {d_rope})."
+        )
+    if d_nope % scale_tile:
+        raise ValueError(
+            f"d_nope {d_nope} must be a multiple of scale_tile {scale_tile}."
+        )
+    if D & (D - 1):
+        raise ValueError(f"row width {D} must be a power of two for the value tile.")
+
+    fp8_p, bf16_p, u8_p, bpp, row_bytes, sbpt, s_off = _paged_fp8_layout(
+        quant_k_cache, page_size, d_nope, d_rope, scale_tile
+    )
+    has_extra = extra_cache is not None
+    if has_extra:
+        if extra_indices is None or extra_page_size is None:
+            raise ValueError(
+                "extra_cache needs extra_indices and extra_page_size as well."
+            )
+        x_fp8, x_bf16, x_u8, x_bpp, _, _, x_s_off = _paged_fp8_layout(
+            extra_cache, extra_page_size, d_nope, d_rope, scale_tile
+        )
+        extra_indices = extra_indices.contiguous()
+        if extra_topk_length is None:
+            extra_topk_length = _topk_length(extra_indices, extra_indices.shape[-1])
+        x_topk = extra_indices.shape[-1]
+    else:
+        x_fp8, x_bf16, x_u8 = fp8_p, bf16_p, u8_p
+        x_bpp, x_s_off, x_topk = bpp, s_off, 1
+        extra_indices = indices
+        extra_topk_length = None
+
+    indices = indices.contiguous()
+    if out is None:
+        out = torch.empty(T, h, D, dtype=torch.bfloat16, device=q.device)
+    if topk_length is None:
+        topk_length = _topk_length(indices, indices.shape[-1])
+    if extra_topk_length is None:
+        extra_topk_length = topk_length
+    if attn_sink is not None:
+        if attn_sink.shape != (h,):
+            raise ValueError(f"attn_sink must be [{h}]; got {tuple(attn_sink.shape)}.")
+        attn_sink = attn_sink.to(torch.float32).contiguous()
+
+    bn, warps, stages = config or _config(q.device)
+    block_h = max(16, triton.next_power_of_2(h))
+    # The decode holds an fp32 staging tile alongside the bf16 one, so a tile the
+    # bf16 path fits can miss the smem budget here; step down as it does.
+    for bn_try, ns_try in _smem_fallbacks(bn, stages):
+        try:
+            _nsa_prefill_paged_fp8_kernel[(T,)](
+                q,
+                fp8_p,
+                bf16_p,
+                u8_p,
+                indices,
+                topk_length,
+                x_fp8,
+                x_bf16,
+                x_u8,
+                extra_indices,
+                extra_topk_length,
+                out,
+                attn_sink if attn_sink is not None else topk_length,
+                sm_scale,
+                indices.shape[-1],
+                x_topk,
+                H=h,
+                BLOCK_H=block_h,
+                D=D,
+                D_NOPE=d_nope,
+                SCALE_TILE=scale_tile,
+                PAGE_SIZE=page_size,
+                BYTES_PER_PAGE=bpp,
+                ROW_BYTES=row_bytes,
+                SCALE_BYTES_PER_TOKEN=sbpt,
+                S_OFFSET_BYTES=s_off,
+                X_PAGE_SIZE=extra_page_size or page_size,
+                X_BYTES_PER_PAGE=x_bpp,
+                X_S_OFFSET_BYTES=x_s_off,
+                BLOCK_N=bn_try,
+                num_warps=warps,
+                num_stages=ns_try,
+                HAS_EXTRA=has_extra,
+                HAS_SINK=attn_sink is not None,
+            )
+            return out
+        except triton.runtime.errors.OutOfResources:
             continue
     raise triton.runtime.errors.OutOfResources(
         0, 0, "shared memory: no fallback config fits this device/shape"
