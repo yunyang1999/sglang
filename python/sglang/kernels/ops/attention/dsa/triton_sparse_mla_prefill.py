@@ -109,11 +109,44 @@ decode (its decode dispatch takes 8), so neither side is padded at decode.
     T=4096     6.928     2.390      1.235      1.016    0.027   1.90x  2.29x
     T=8192    13.651     4.746      2.454      2.017    0.027   1.91x  2.32x
 
-    decode    fi h=64   fi h=8    ours bf16   ours fp8   prep    bf16    fp8
-    B=1        0.125     0.124      0.0396     0.0311   0.026   1.88x  2.15x
-    B=8        0.126     0.124      0.0394     0.0308   0.026   1.89x  2.17x
-    B=32       0.130     0.128      0.0398     0.0310   0.026   1.93x  2.22x
-    B=64       0.374     0.124      0.0413     0.0315   0.026   1.83x  2.14x
+The decode rows first published here were measured eagerly and were wrong; they
+are replaced below. FlashInfer's wrapper carries ~106 us of host overhead --
+0.124 ms eager against 0.0205 ms under CUDA-graph replay, which is what an
+SGLang decode step actually pays. This kernel measures ~0.039 ms either way, so
+eager timing flattered us by roughly 6x on that arm. Prefill is unaffected:
+prefill is not graph-captured, so eager is the right methodology there, and at
+T >= 2048 the 106 us is under 2% of the baseline (it does inflate the T=512 row).
+
+Decode, re-measured under CUDA-graph replay, with a split-K path added
+(`_nsa_decode_split_kernel` + `_nsa_decode_merge_kernel`, grid (T,S) then (T,H);
+S=1 dispatches the existing kernel unchanged and is bitwise identical to it):
+
+    B    fi h=8    ours unsplit   ours split-K   split vs fi   fp8 split vs fi
+    1    0.0205      0.0390         0.0082          2.50x          1.43x
+    2    0.0205      0.0391         0.0082          2.49x          1.33x
+    4    0.0205      0.0389         0.0087          2.36x          1.25x
+    8    0.0206      0.0391         0.0102          2.01x          0.77x
+    16   0.0266      0.0409         0.0123          2.16x          0.57x
+    32   0.0410      0.0410         0.0205          2.00x          0.45x
+    64   0.0615      0.0418         0.0348          1.77x          0.40x
+
+Three things this says that the eager numbers hid:
+
+* **The unsplit path loses under graphs at B <= 32** (0.53x at B=1). One program
+  per query token leaves 1 SM of 84 busy; nothing about that is fixed by the
+  per-token maths being good. Split-K is what makes decode competitive, and its
+  win is real GPU time rather than recovered launch overhead.
+* Split-K does not fill the device either -- at B=1 it lights 10-20 SMs of 84,
+  because 84 splits of topk 640 would be under 8 candidates each. The gain is a
+  shorter serial chain, not occupancy.
+* **The paged-fp8 arm goes 0.12x -> 1.43x at B=1 (11.8x its own unsplit form)
+  and still loses above B=4.** Splitting hides the gather deficit at small
+  batch; it does not fix it. That deficit is the remaining work.
+
+Split-path accuracy: cos >= 0.9999956 at every (B, S) measured, max_abs 0.00195
+= exactly one bf16 ULP for outputs in [0.5, 1), i.e. it differs from the unsplit
+reference by at most the output format's own quantum. fp32 partials move cos to
+0.9999974 and do not move max_abs, so bf16 partials are enough.
 
 Accuracy, against an fp32 oracle over the values the KV cache actually holds --
 production stores fp8 and both kernels read it, so that is the only reference
