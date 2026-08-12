@@ -721,6 +721,100 @@ class TestNativePagedFP8(CustomTestCase):
                             cos_min=0.99999, max_abs=0.01,
                         )
 
+    def test_head_tile_matches_untiled(self):
+        """Head tiling is a pure indexing change -- same head, same candidate
+        order, different program -- so every tile must agree with the untiled
+        launch bit for bit.
+
+        Both members of `_FP8_MMA_CAPS` (sm_89, sm_120) issue mma.sync at every
+        BLOCK_H, which is what makes the bitwise claim hold. Should a wgmma arch
+        ever be admitted, note that wgmma's M is fixed at 64: BLOCK_H=64 would
+        then compile to a different instruction class than BLOCK_H<=32 and the
+        last bf16 bit would differ for reasons unrelated to tiling. Compare
+        tiles within one class if that day comes.
+        """
+        native = self._entry()
+        S, PAGE, topk = 2048, 256, 640
+        pool, _ = _build_paged_fp8_pool(S, PAGE, seed=13)
+        for h in (16, 32, 64):
+            g = torch.Generator(device="cuda").manual_seed(h)
+            q = torch.randn(
+                96, h, 512, dtype=torch.bfloat16, device="cuda", generator=g
+            )
+            idx = _random_indices(96, topk, S, g)
+            sink = torch.randn(h, dtype=torch.float32, device="cuda", generator=g)
+            ref = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink, block_h=h)
+            for tile in (8, 16, 32):
+                if tile >= h:
+                    continue
+                with self.subTest(h=h, block_h=tile):
+                    got = native(
+                        q, pool, idx, SM_SCALE, PAGE, attn_sink=sink, block_h=tile
+                    )
+                    self.assertTrue(
+                        torch.equal(ref, got),
+                        f"native head tile {tile} diverged from untiled at h={h}",
+                    )
+
+    def test_head_tile_matches_untiled_split(self):
+        """Same, through the split-K decode kernel. The partials are addressed
+        as `mid_o[t, h, s, :]` with an absolute h, so tiling must leave both the
+        layout and the merge untouched."""
+        native = self._entry()
+        S, PAGE, topk = 2048, 256, 640
+        pool, _ = _build_paged_fp8_pool(S, PAGE, seed=17)
+        for B in (1, 32):
+            for splits in (1, 4, 10):
+                with self.subTest(B=B, splits=splits):
+                    g = torch.Generator(device="cuda").manual_seed(B + splits)
+                    q = torch.randn(
+                        B, 64, 512, dtype=torch.bfloat16, device="cuda", generator=g
+                    )
+                    idx = _random_indices(B, topk, S, g)
+                    sink = torch.randn(
+                        64, dtype=torch.float32, device="cuda", generator=g
+                    )
+                    ref = native(
+                        q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
+                        splits=splits, block_h=64,
+                    )
+                    got = native(
+                        q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
+                        splits=splits, block_h=16,
+                    )
+                    self.assertTrue(
+                        torch.equal(ref, got),
+                        f"native split head tile diverged at B={B} S={splits}",
+                    )
+
+    def test_head_tile_default_is_pinned_only_where_swept(self):
+        """An arch with no `_PINNED_NATIVE_HEAD_TILE` entry must keep the
+        untiled tile, so enabling this cannot change a device nobody measured.
+        """
+        import triton
+
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            _NATIVE_BLOCK_H,
+            _PINNED_NATIVE_HEAD_TILE,
+            _native_head_tile,
+        )
+
+        mono = max(_NATIVE_BLOCK_H or 0, triton.next_power_of_2(64))
+        unswept = (7, 0)
+        self.assertNotIn(unswept, _PINNED_NATIVE_HEAD_TILE)
+        # The table is keyed by capability, so drive the resolver directly
+        # rather than through a device we do not have.
+        self.assertEqual(
+            _PINNED_NATIVE_HEAD_TILE.get(unswept, {}).get(64, mono), mono
+        )
+        self.assertEqual(_PINNED_NATIVE_HEAD_TILE[(12, 0)][64], 16)
+        # An explicit override is taken literally but never exceeds the tile
+        # that covers every head.
+        self.assertEqual(_native_head_tile(torch.cuda.current_device(), 64,
+                                           mono, override=128), mono)
+        self.assertEqual(_native_head_tile(torch.cuda.current_device(), 64,
+                                           mono, override=16), 16)
+
     def test_fp8_gate_excludes_sm121(self):
         # sm_121 accepts fp8 operands but software-emulates them, so the gate is
         # set membership rather than a >= comparison. _PINNED carries a (12, 1)

@@ -490,19 +490,49 @@ nothing and why the grid was the only axis left. Removing 60% of the tensor ops
 in a kernel 57.9% math-throttled predicts 1.6-1.8x; the delivered 0.67 -> 1.20
 is 1.79x.
 
-**The next lever is 128 bytes.** The head-tiled kernel at h=64 compiles to
-exactly the profiled h=16 kernel, run on grid (T, 4), so its profile is the new
-baseline: `launch__occupancy_limit_shared_mem = 1` while
-`launch__occupancy_limit_registers = 2` -- shared memory is the *sole* limiter --
-with 1.001 warps/scheduler, `wait` at 42.2%, and NCU estimating 63.3% from both
-Theoretical Occupancy and Issue Slot Utilisation. Two blocks/SM needs dynamic
-shared <= 50,176 B. The BLOCK_H=16 / BLOCK_N=32 / 4-warp cubin is **50,304 B**:
-Q 16,384 + KV 32,768 + P 1,024 + **idx 128**. It misses by exactly the 128-byte
-index staging buffer, and its mma count is already the algorithmic minimum.
-Finding those 128 bytes -- stopping the pipeliner staging `idx` in smem, or
-folding the 32-entry index tile into the P round trip -- is worth an estimated
-**1.15-1.30x** (ceilings: 1.63x from issue slots, 2.3x from the tensor pipe at
-43.5% cycles-active). Not bitwise identical: the softmax tile boundaries move.
+**The "next lever is 128 bytes" claim was wrong, and is withdrawn.** It read the
+byte budget off the TTGIR `local_alloc` ops -- Q 16,384 + KV 32,768 + P 1,024 =
+50,176, plus a 128 B index tile -- and concluded the BLOCK_H=16 / BLOCK_N=32 /
+4-warp cubin missed 2 blocks/SM by exactly that index buffer. Compiling the
+kernel for sm_120 ahead of time and reading `metadata.shared` says the cubin
+actually carries **57,344 B** at num_stages=1 and 57,472 at 2. The three named
+allocations do sum to 50,176; the other **7,168 B** is compiler scratch that no
+`local_alloc` names. So the gap to the real 2-block threshold (101,376 / 2 =
+50,688 B) is 6,656 B, not 128, and no amount of index-buffer surgery closes it.
+The rest of that profile still holds -- shared memory *is* the sole occupancy
+limiter, and the mma count *is* already the algorithmic minimum -- which is why
+the bf16 arm has no cheap occupancy win left. Every mma-minimal bf16 tile on
+sm_120 (H16/N32, H16/N64, H32/N32, H32/N64, H64/N64) is above the threshold; the
+two tiles that fit (H16/N16 at 36,928 B, H8/N32 at 49,280 B) buy their second
+block with 1.50x and 2.00x the tensor work respectively.
+
+**Where the occupancy win actually was: the native fp8 arm, which never got head
+tiling.** `_nsa_prefill_paged_fp8_native_kernel` indexed heads as
+`tl.arange(0, BLOCK_H)` on grid `(T,)`, and `block_h = max(_NATIVE_BLOCK_H,
+next_pow2(h))` pinned that to 64 at DeepSeek-V4's padded h=64 -- the same
+monolithic shape this file had just finished removing from the bf16 arm. Its
+sm_120 cubin at the pinned BLOCK_N=64:
+
+    BLOCK_H  shared     blk/SM  warps/SM  spill   tensor work
+    64       82,176 B   1       4         9,104 B  1.00x   <- was shipping
+    32       41,088 B   2       8         1,612 B  1.00x
+    16       31,872 B   3       12          240 B  1.00x   <- now pinned (BLOCK_N=32)
+    8        27,264 B   3       12            0 B  2.00x
+
+Tiling to BLOCK_H=16 is **3x the resident warps and 38x less spill traffic at an
+identical mma count** -- not a trade, which is what makes it different from every
+bf16 tile above. BLOCK_H=8 is excluded deliberately: mma's M granularity is 16,
+so an 8-row tile issues the same instructions for half the useful rows. It
+survives only where H itself is 8 and no wider tile is legal.
+
+This is a pure indexing change, so tiles agree bit for bit -- verified at h=16,
+32 and 64, through the split-K decode kernel at every (B, splits), and on ragged
+rows. One caveat for whoever adds an arch to `_FP8_MMA_CAPS`: wgmma's M is fixed
+at 64, so on sm_90 BLOCK_H=64 compiles to wgmma (168 of them, zero mma.sync)
+while BLOCK_H<=32 falls back to mma.sync, and the accumulation order differs by
+one to two bf16 ULP. sm_120 has no wgmma -- BLOCK_H 64/32/16 emit 576/288/144
+mma.sync -- so the bitwise claim holds there. Compare tiles within one
+instruction class if a wgmma arch is ever admitted.
 
 Three levers the same profile **closes**, so they need not be retried: fp8 for
 the QK dot (tensor subpipe only 25.5% active and math throttle 25.7% of samples,
@@ -3168,7 +3198,13 @@ def _nsa_prefill_paged_fp8_native_kernel(
     t = tl.program_id(0)
     D: tl.constexpr = D_NOPE + D_ROPE
 
-    h = tl.arange(0, BLOCK_H)
+    # Head tile, as in `_nsa_prefill_kernel`: grid dim 1 is ceil(H / BLOCK_H), so
+    # a program owns one (token, head tile) rather than one token. Every use of
+    # `h` below -- q, sink, output -- is already an ABSOLUTE head index, so
+    # offsetting it here is the whole change. With BLOCK_H >= H the grid dim is
+    # 1, `hb` is 0, and this is bit for bit the untiled kernel.
+    hb = tl.program_id(1)
+    h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     hmask = h < H
     col = tl.arange(0, SCALE_TILE)  # lanes within one fp8 chunk
     rcol = tl.arange(0, D_ROPE)  # lanes within the bf16 rope tail
@@ -3357,7 +3393,11 @@ def _nsa_decode_split_paged_fp8_native_kernel(
     s = tl.program_id(1)
     D: tl.constexpr = D_NOPE + D_ROPE
 
-    h = tl.arange(0, BLOCK_H)
+    # Head tile on grid dim 2 -- dims 0 and 1 are already token and split. The
+    # partials are addressed as `mid_o[t, h, s, :]` with an absolute `h`, so
+    # tiling the heads leaves both the layout and `_merge_launch` untouched.
+    hb = tl.program_id(2)
+    h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     hmask = h < H
     col = tl.arange(0, SCALE_TILE)  # lanes within one fp8 chunk
     rcol = tl.arange(0, D_ROPE)  # lanes within the bf16 rope tail
@@ -3511,6 +3551,54 @@ def _native_config(device, num_heads):
     # 8-bit operands need K >= 32 (`min_dot_size`), and BLOCK_N is the reduction
     # extent of the PV dot, so a narrower tile would not compile.
     return max(32, bn), warps, stages
+
+
+# Head tile for the native arm, keyed the same way as `_PINNED_HEAD_TILE` but
+# swept separately -- this kernel holds eight 64-wide fp32 accumulators per row
+# rather than one [BLOCK_H, D_V] tile, so its register and smem curves are not
+# the bf16 kernel's.
+#
+# At DeepSeek-V4's padded h=64 the untiled tile is BLOCK_H=64 with the pinned
+# BLOCK_N=64, and on sm_120 that cubin is 82,176 B of shared memory (1 block/SM,
+# 4 warps/SM) and **spills 9,104 B**. Tiling to BLOCK_H=16 with BLOCK_N=32 gives
+# 31,872 B (3 blocks/SM, 12 warps/SM) and 240 B of spill, at an *identical* mma
+# count -- 3x the resident warps and 38x less spill traffic for no extra tensor
+# work. Measured by compiling this kernel for sm_120 ahead of time and reading
+# `metadata.shared` plus ptxas -v (probe/aot_sm120_native.py); the method and
+# its two traps are in probe/README_DSV4_SM120.md.
+#
+# BLOCK_H=8 is deliberately absent: mma's M granularity is 16, so an 8-row tile
+# issues the same instructions for half the useful rows (2.00x the tensor work
+# in the same sweep). It survives only where H itself is 8, where the tile
+# cannot be wider than H anyway.
+#
+# No (12, 1) entry, unlike `_PINNED_HEAD_TILE`: sm_121 is not in
+# `_FP8_MMA_CAPS`, so this arm never runs there, and a table row implying it was
+# measured is the exact trap `test_fp8_gate_excludes_sm121` was written for.
+_PINNED_NATIVE_HEAD_TILE: dict = {
+    (12, 0): {32: 16, 64: 16},
+}
+
+# BLOCK_N pinned alongside the head tile: at BLOCK_H=16 the sm_120 sweep puts
+# 32 at 31,872 B against 54,528 B for 64, which is the difference between 3
+# blocks/SM and 1. `_NATIVE_TILE`'s 64 was swept at the untiled BLOCK_H=64.
+_PINNED_NATIVE_TILED_BN: dict = {(12, 0): 32}
+
+
+def _native_head_tile(device, num_heads, mono, override=None):
+    """Head rows per program for the native arm.
+
+    Same contract as `_head_tile`: returns ``mono`` -- one program per token
+    holding every head -- unless this (arch, head count) has a measured entry,
+    and never exceeds ``mono``, so an unswept device reproduces the untiled
+    kernel exactly.
+    """
+    if override:
+        tile = min(int(override), mono)
+    else:
+        cap = torch.cuda.get_device_capability(device)
+        tile = _PINNED_NATIVE_HEAD_TILE.get(cap, {}).get(num_heads, mono)
+    return max(1, min(triton.next_power_of_2(tile), mono))
 
 
 def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile):
@@ -3673,10 +3761,18 @@ def sparse_mla_prefill_paged_fp8_native(
     else:
         bn, warps, stages = _native_config(q.device, h)
     # `_NATIVE_BLOCK_H` is a *floor* swept at DeepSeek-V4's post-TP8 h=8, not a
-    # value: the head mma tile must still cover every head, so a wider head count
-    # raises it. Applying it unconditionally computed only the first 8 rows and
-    # left the rest undefined (cos 0.58 at h=16).
-    block_h = block_h or max(_NATIVE_BLOCK_H or 0, triton.next_power_of_2(h))
+    # value: an untiled head mma tile must still cover every head, so a wider
+    # head count raises it. Applying it unconditionally computed only the first
+    # 8 rows and left the rest undefined (cos 0.58 at h=16). That resolved value
+    # is now the *monolithic* tile, i.e. the ceiling `_native_head_tile` may cut
+    # down to on a device where a narrower tile was measured.
+    mono_h = max(_NATIVE_BLOCK_H or 0, triton.next_power_of_2(h))
+    block_h = _native_head_tile(q.device, h, mono_h, override=block_h)
+    if config is None and block_h < mono_h:
+        # `_NATIVE_TILE`'s BLOCK_N was swept against the untiled tile; the head
+        # tile changes which BLOCK_N fits. An explicit `config` still wins.
+        bn = max(32, _PINNED_NATIVE_TILED_BN.get(
+            torch.cuda.get_device_capability(q.device), bn))
     # Byte offsets, not element offsets: a pool is `num_pages * bytes_per_page`
     # bytes, so int32 addressing holds only for pools under 2 GiB.
     if int64_indexing is None:
@@ -3704,7 +3800,9 @@ def sparse_mla_prefill_paged_fp8_native(
             if bn_try < 32:
                 continue
             try:
-                _nsa_decode_split_paged_fp8_native_kernel[(T, splits)](
+                _nsa_decode_split_paged_fp8_native_kernel[
+                    (T, splits, triton.cdiv(h, block_h))
+                ](
                     q, fp8_p, bf16_p, u8_p, indices, topk_length,
                     x_fp8, x_bf16, x_u8, extra_indices, extra_topk_length,
                     mid_o, mid_m, mid_l,
@@ -3748,7 +3846,7 @@ def sparse_mla_prefill_paged_fp8_native(
         if bn_try < 32:
             continue
         try:
-            _nsa_prefill_paged_fp8_native_kernel[(T,)](
+            _nsa_prefill_paged_fp8_native_kernel[(T, triton.cdiv(h, block_h))](
                 q,
                 fp8_p,
                 bf16_p,
