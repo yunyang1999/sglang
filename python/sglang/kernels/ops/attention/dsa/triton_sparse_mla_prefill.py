@@ -3561,6 +3561,24 @@ def _nsa_decode_split_paged_fp8_native_kernel(
 #   min_chunks 2 scores 1.137, 3 scores 1.615, 4 scores 1.801. One BLOCK_N=64
 #   tile per split still amortises the split's fixed cost (a 7-chunk Q
 #   quantisation, an epilogue and a 512-wide partial write).
+#
+# Re-swept on sm_120 once head tiling landed, against the shipping
+# (BLOCK_H=16, BLOCK_N=64, 4 warps). Six candidates, decode under CUDA-graph
+# replay over B in {1..256} and prefill over T in {512..8192} (job 3626122,
+# RTX 5080), as speedup vs shipping -- gmean decode / gmean prefill:
+#
+#     H16 N64 w8   0.78x / 0.61x     H32 N64 w8   0.91x / 0.86x
+#     H8  N64 w8   0.57x / 0.36x     H16 N32 w8   0.58x / 0.39x
+#     H64 N64 w4   0.45x / 0.35x  (the tile before head tiling)
+#
+# Nothing beats it, and the 8-warp arms lose worst -- which is the second time
+# the static resource table has been wrong about speed in the same direction.
+# It called (16, 64, 8) a strict improvement: zero spill against 1,320 B, twice
+# the resident warps, identical shared memory, identical mma count. It measures
+# 22% slower on decode and 39% on prefill, because eight warps widen the softmax
+# row reduction into a deeper cross-warp tree and the barrier traffic costs more
+# than the spill did. Shared memory and spill bytes are worth reading; they are
+# not worth believing without a stopwatch.
 _NATIVE_TILE = (64, 4, 2)  # (BLOCK_N, warps, stages); None -> `_config`
 _NATIVE_BLOCK_H = 8  # floor for the head mma tile; raised to cover wider h
 _MIN_CHUNKS_NATIVE = 1  # tiles per split below which a split does not pay
