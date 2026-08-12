@@ -457,6 +457,54 @@ S=8192 pool rows:
   fp32 accumulator it rescales and writes every iteration. Halving it is what
   ``_PINNED_NARROW_H`` buys, and it is worth 1.27-1.47x.
 
+The advantage is a function of head count, and it reverses above ~32
+--------------------------------------------------------------------------
+Everything else in this file was measured at h=8, DeepSeek-V4's post-TP8 count.
+At a wider head count the design inverts, and the crossover is not a tuning
+artefact. Measured on an RTX PRO 6000 against FlashInfer's `_sparse_mla_sm120`
+in production form (page transcode charged to it, our workspace dequantise
+charged to us):
+
+    heads   T=512   T=1024   T=2048   T=4096      <- ours / theirs
+      16    1.21x    1.32x    1.35x    1.51x
+      64    0.87x    0.84x    0.92x    0.96x
+
+NCU at T=1024 names the mechanism: the `[BLOCK_H, d_v]` fp32 accumulator. At
+h=64, `BLOCK_H=64` makes it 64x512x4 B over 256 threads = **128 registers per
+thread of 246**, against a 255 cap, pinning the kernel to 1 block/SM. Our cost
+per head *rises* 1.60x from h=16 to h=64; FlashInfer's *falls* 1.25x, because it
+amortises one gather over more heads and splits each token across two blocks
+(grid 2048 against our 1024). A full `BLOCK_N x warps x stages` sweep at h=64
+found the pinned tile already optimal at every T, so this is structural.
+
+**Tiling the head dimension across the grid fixes it, and is the one structural
+change nothing here had tried.** Every experiment in this file holds
+`BLOCK_H = H` and varies the tile; none varies the grid, which stays `(T,)`.
+Running grid `(T, H/16)` -- four programs per token, each with a `[16, 512]`
+accumulator -- trades a 4x re-gather (L2-resident, 77.6% hit) for a 4x smaller
+accumulator. Emulated as four 16-head calls over the same KV and indices:
+
+    T        theirs   ours monolithic   ours head-tiled(16)   vs theirs
+    512      0.4073       0.4483              0.3926            0.99x
+    1024     0.8188       0.9685              0.7117            1.12x
+    2048     1.6285       1.7421              1.3260            1.21x
+    4096     3.2176       3.4600              2.7768            1.15x
+
+A 0.84x loss becomes a 1.12x win at h=64. Tile width 8 is worse (0.95x of
+monolithic -- an 8x re-gather is too much); width 32 was not cleanly measured.
+The 1.12x is emulated rather than implemented, so treat it as a strong signal
+rather than a delivered number.
+
+Two things this reframes. First, the head-padding advantage that dominates the
+h=8 story is worth nothing here: at h=16 the 16-row mma tile is exactly full,
+and at h=64 there is no padding to avoid. What remains is the page transcode we
+skip, measured at 1.501 ms against FlashInfer's 2.627 ms kernel, i.e. ~36% of
+their prefill attention time -- though that probe used uniformly random indices
+so every page was transcoded, which flatters us. Second, a deployment using
+SGLang's DP attention resolves to a *wider* head count, not narrower:
+`--tp 4 --dp 4 --enable-dp-attention` gives `attn_tp_size = 1` and therefore
+`n_local_heads = 64`, with the padding block gated off entirely.
+
 What is *not* left on the table (measured, so it need not be re-derived)
 -----------------------------------------------------------------------
 Nsight Compute puts the remaining headroom at occupancy — 2 blocks per SM,
