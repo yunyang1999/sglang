@@ -2148,6 +2148,10 @@ def _nsa_prefill_paged_fp8_kernel(
 
 
 def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile):
+    # Shadowed: the definition further down, next to the native arm, is the one
+    # that binds for both paths. Kept here only so this half of the file reads
+    # in order -- edit the other one. (It is the fixed version; this copy would
+    # reject the non-contiguous pool SGLang actually hands over.)
     u8 = cache.view(torch.uint8)
     assert u8.is_contiguous(), "the paged cache must be contiguous"
     row_bytes = d_nope + d_rope * 2
@@ -3686,21 +3690,40 @@ def _native_head_tile(device, num_heads, mono, override=None):
 
 
 def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile):
-    """Three aliased flat views of one pool, plus its byte strides.
+    """Three aliased views of one pool, plus its byte strides.
 
     Page interior is ``[P x row_bytes data][P x scale_bytes footer]``; a row is
     ``d_nope`` fp8 bytes then ``d_rope`` bf16 (DSv4: 448 + 128 = 576 B), and the
     per-token scale slot is padded to a power of two (7 scales in 8 B). Indices
-    are absolute token ids into a contiguous pool -- there is no page table.
+    are absolute token ids into the pool -- there is no page table.
+
+    **The pool does not have to be contiguous, and in SGLang it is not.**
+    `deepseek_v4_backend` hands over
+    ``swa_k_cache[:, : swa_window_size * k_cache_total_dim]``, a slice along
+    dim 1, so consecutive pages sit `stride(0)` bytes apart in a *wider* parent
+    buffer rather than `shape[-1]`. The kernel already addresses pages as
+    ``page * BYTES_PER_PAGE + ...``, so handing it the stride instead of the
+    width is the whole fix.
+
+    An earlier version asserted contiguity and flattened with ``reshape(-1)``.
+    The assert is what caught this -- had it not been there, ``reshape`` would
+    have silently **copied the entire KV cache on every layer of every forward**,
+    which is a correctness-preserving disaster rather than a crash. Only the
+    last dimension has to be dense, which is what makes the dtype views legal;
+    Triton takes a pointer, so nothing needs flattening at all.
     """
     u8 = cache.view(torch.uint8)
-    assert u8.is_contiguous(), "the paged cache must be contiguous"
+    assert u8.stride(-1) == 1, (
+        "the paged cache must be dense along its last dimension "
+        f"(got stride {u8.stride()})"
+    )
+    assert u8.dim() == 2, f"expected [pages, bytes_per_page], got {tuple(u8.shape)}"
     row_bytes = d_nope + d_rope * 2
     return (
-        u8.view(_FP8_DTYPE).reshape(-1),
-        u8.view(torch.bfloat16).reshape(-1),
-        u8.reshape(-1),
-        u8.shape[-1],  # bytes per page
+        u8.view(_FP8_DTYPE),
+        u8.view(torch.bfloat16),
+        u8,
+        u8.stride(0),  # page-to-page distance in bytes, NOT the page width
         row_bytes,
         triton.next_power_of_2(d_nope // scale_tile),
         page_size * row_bytes,  # start of the page's scale footer

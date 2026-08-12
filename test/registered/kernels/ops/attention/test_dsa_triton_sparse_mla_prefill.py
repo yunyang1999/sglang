@@ -905,6 +905,39 @@ class TestNativePagedFP8(CustomTestCase):
         self.assertEqual(_native_head_tile(torch.cuda.current_device(), 64,
                                            mono, override=16), 16)
 
+    def test_sliced_pool_matches_contiguous(self):
+        """SGLang does not hand over a contiguous pool.
+
+        `deepseek_v4_backend` passes
+        `swa_k_cache[:, : swa_window_size * k_cache_total_dim]` -- a slice along
+        dim 1 -- so consecutive pages sit `stride(0)` bytes apart in a wider
+        parent buffer, not `shape[-1]`. Every synthetic pool in this file is
+        contiguous, so nothing here caught it until a server refused to start
+        with `AssertionError: the paged cache must be contiguous`. Widen the
+        pool, slice it back, and the two must agree bit for bit.
+        """
+        native = self._entry()
+        S, PAGE, topk = 2048, 256, 640
+        pool, _ = _build_paged_fp8_pool(S, PAGE, seed=37)
+        pages, width = pool.shape
+        # Same bytes, but each page now starts 512 B further apart.
+        wide = torch.zeros(pages, width + 512, dtype=pool.dtype, device="cuda")
+        wide[:, :width] = pool
+        sliced = wide[:, :width]
+        self.assertFalse(sliced.is_contiguous())
+        self.assertEqual(sliced.stride(0), width + 512)
+
+        g = torch.Generator(device="cuda").manual_seed(41)
+        q = torch.randn(64, 64, 512, dtype=torch.bfloat16, device="cuda", generator=g)
+        idx = _random_indices(64, topk, S, g)
+        sink = torch.randn(64, dtype=torch.float32, device="cuda", generator=g)
+        ref = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink)
+        got = native(q, sliced, idx, SM_SCALE, PAGE, attn_sink=sink)
+        self.assertTrue(
+            torch.equal(ref, got),
+            "a sliced (non-contiguous) pool gave a different answer",
+        )
+
     def test_fp8_gate_excludes_sm121(self):
         # sm_121 accepts fp8 operands but software-emulates them, so the gate is
         # set membership rather than a >= comparison. _PINNED carries a (12, 1)
