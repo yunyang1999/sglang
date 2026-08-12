@@ -470,6 +470,47 @@ topk 640, h=8), T=4096 unless stated:
   {1,2,3,4} were timed: the shipping ``BLOCK_H=8 (32,4,3)`` wins at 1.186 ms,
   ahead of ``(32,4,4)`` 1.198 and ``(16,2,2)`` 1.354. Nothing in the tile space
   buys the 29.6%.
+* **swap-AB was built in CUDA and measured. The premise holds exactly; the
+  payoff does not.** `mma.sync.aligned.m16n8k16` has N granularity 8, so
+  transposing both dots (`S^T = K.Q^T`, `O^T = V^T.P^T`) puts h=8 on N with no
+  padding. A hand-written sm_120a microbenchmark confirms it in SASS: **4.00
+  HMMA per KV row against the standard orientation's 8.00**, independent of
+  BLOCK_N and of the warp partition -- 42.95 GFLOP issued against 85.90, i.e.
+  exactly the required figure. Core-loop speedup 1.46x at BLOCK_N=32 and
+  **1.92x at 64**; registers halve (240 -> 120 with Q resident); cosine
+  0.9999988 against an fp64 oracle.
+
+  **The relayout everyone assumes is the blocker is free.** Transposing the
+  `S^T` accumulator into a B operand costs 2 `movmatrix` per warp per iteration
+  against 32 HMMA saved -- and a variant that stores P as `[kv][head]` and reads
+  it back with `ldmatrix.x2.trans` needs **zero** `movmatrix` and measures
+  identically (15.761 vs 15.794 ns/kv-row). Both ride free on a shared-memory
+  round trip of P that *both* orientations already need, because the warps that
+  produce S are not the warps that consume it. FlashInfer's own SM120 kernel
+  does the same round trip. So the reason FA, FlashMLA and FlashInfer all stay
+  in the standard orientation is not relayout cost.
+
+  **But in a complete kernel it is worth 1.09x, not the 1.35-1.5x derived here.**
+  Built both orientations over one skeleton (identical `LDGSTS` counts in SASS,
+  differing only in HMMA 64 vs 32): swap-AB beats its matched control by
+  **1.092x at T=4096 and 1.089x at T=8192**, reproduced on a second SM120 part
+  at 1.046x/1.106x. Solving the two arms gives an mma-structured core of 0.378
+  ms against 1.058 ms of everything else -- **the dots are only ~26% of the
+  kernel**, so halving them caps at 1.09x.
+
+  The derivation was wrong for an instructive reason: it assumed the 2.00x
+  tensor-FLOP overhead translated into runtime at the ~44% the profile
+  attributes to the dots. It does not, and this file already said why -- "the PV
+  side is not paying for arithmetic, it is paying for the wide `[BLOCK_H, d_v]`
+  fp32 accumulator". A hand-written kernel fixes that accumulator *regardless of
+  orientation*; once fixed, the mma instructions are a quarter of the kernel.
+
+  The hand-written kernel reaches 0.895x of this Triton one at T=4096
+  (1.3146 ms against 1.1761), losing entirely on its gather (1.058 ms against
+  Triton's ~0.66). Precomputing row pointers at index-staging time moved it
+  0.830x -> 0.895x, so that axis is live, but the swap's own contribution stays
+  ~1.09x either way. Sources at `probe/../swapab/{phase1,phase2}.cu`.
+
 * **The mma padding at h=8 cannot be removed without sharing the gather.**
   Eight real head rows sit in a 16-row mma tile, so half the tensor rows are
   padding, and transposing the dots does not help: it moves the pad from M to N,
