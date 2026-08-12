@@ -3579,6 +3579,21 @@ def _nsa_decode_split_paged_fp8_native_kernel(
 # row reduction into a deeper cross-warp tree and the barrier traffic costs more
 # than the spill did. Shared memory and spill bytes are worth reading; they are
 # not worth believing without a stopwatch.
+#
+# NCU says why the whole axis is closed: at BLOCK_H=16, B=128 the report carries
+# `Block Limit Registers = 2` **and** `Block Limit Shared Mem = 2` at once, so
+# relieving either one alone gains exactly nothing -- 3 blocks/SM would need
+# <=170 registers/thread *and* <=33,109 B of smem together. Both regressions
+# above moved exactly one of the two. The kernel is latency-bound on the L1 path
+# (`No Eligible` 73.85%, `Eligible Warps/Scheduler` 0.31, L1/TEX throughput
+# 50.92% against DRAM 8.02% and 3% of FP32 peak), not occupancy-bound.
+#
+# `loop_unroll_factor=2` on the four candidate-list loops was tried on the same
+# reading of NCU's `Branch Efficiency` (11.76% at BLOCK_H=16 against 100% at 64)
+# and lost harder than anything else: 0.62x decode, 0.47x prefill, output bitwise
+# identical. Host-side it takes spill 1,320 -> 5,232 B and the static branch
+# count 4 -> 8, i.e. it costs registers without removing a single branch. Low
+# branch efficiency here is lane divergence in the gather, not a rolled loop.
 _NATIVE_TILE = (64, 4, 2)  # (BLOCK_N, warps, stages); None -> `_config`
 _NATIVE_BLOCK_H = 8  # floor for the head mma tile; raised to cover wider h
 _MIN_CHUNKS_NATIVE = 1  # tiles per split below which a split does not pay
