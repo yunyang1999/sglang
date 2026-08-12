@@ -572,6 +572,14 @@ partials-and-merge structure this kernel exists to avoid. It wins at these sizes
 anyway because everything in the regime is latency-bound, not because the shape
 suits it.
 
+Known gap: the two paged-fp8 device helpers (``_paged_fp8_row_tile`` and
+``_native_tile``) still test only ``idx >= 0``. Their bound is a token count
+rather than a row count and neither their caller kernels nor their launches
+carry it, so closing it is a wider change than the flat-KV path was. Both are
+reached only through the opt-in ``sparse_mla_prefill_paged_fp8*`` entries, not
+the default path. Until they are fixed, a caller that can produce an index at
+or past its pool must clamp before calling them.
+
 All tunables are explicit arguments — the module reads no environment
 variables. If a tuned tile exceeds the device shared-memory budget (e.g. a
 large head count on SM120's 100 KB), the launcher steps down through smaller
@@ -610,6 +618,7 @@ def _nsa_prefill_kernel(
     sink_ptr,  # [H] fp32 learned per-head sink logit; unused when not HAS_SINK
     sm_scale,
     topk,
+    n_rows,  # rows in the KV pool; an index at or past it is invalid
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     D_QK: tl.constexpr,
@@ -675,7 +684,11 @@ def _nsa_prefill_kernel(
     k_len = tl.load(len_ptr + t)
     for k0 in tl.range(0, k_len, BLOCK_N):
         idx = tl.load(idx_ptr + t * topk + k0 + n, mask=(k0 + n) < k_len, other=-1)
-        valid = idx >= 0
+        # An index at or past the pool is invalid, exactly as this module's
+        # contract states. Testing only `>= 0` let a stale slot -- the DSA
+        # top-k writes into a buffer shared across layers, so an unwritten one
+        # can hold any large positive value -- address past the pool's end.
+        valid = (idx >= 0) & (idx < n_rows)
         if IDX64:
             row = tl.where(valid, idx, 0).to(tl.int64)
         else:
@@ -1428,6 +1441,7 @@ def sparse_mla_prefill(
                     mid_l,
                     sm_scale,
                     topk,
+                    kv_in.shape[0],
                     splits,
                     H=h,
                     BLOCK_H=block_h,
@@ -1463,6 +1477,7 @@ def sparse_mla_prefill(
                 attn_sink if attn_sink is not None else scales,
                 sm_scale,
                 topk,
+                kv_in.shape[0],
                 H=h,
                 BLOCK_H=block_h,
                 D_QK=d_qk,
@@ -2034,6 +2049,7 @@ def _nsa_decode_split_kernel(
     mid_l_ptr,  # [T, H, splits] fp32 -- running denominator, 0 for an empty split
     sm_scale,
     topk,
+    n_rows,  # rows in the KV pool; an index at or past it is invalid
     splits,  # runtime, not constexpr: one compilation serves every batch size
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -2085,7 +2101,11 @@ def _nsa_decode_split_kernel(
     hi = tl.minimum(lo + c_tiles * BLOCK_N, k_len)
     for k0 in tl.range(lo, hi, BLOCK_N):
         idx = tl.load(idx_ptr + t * topk + k0 + n, mask=(k0 + n) < hi, other=-1)
-        valid = idx >= 0
+        # An index at or past the pool is invalid, exactly as this module's
+        # contract states. Testing only `>= 0` let a stale slot -- the DSA
+        # top-k writes into a buffer shared across layers, so an unwritten one
+        # can hold any large positive value -- address past the pool's end.
+        valid = (idx >= 0) & (idx < n_rows)
         if IDX64:
             row = tl.where(valid, idx, 0).to(tl.int64)
         else:
