@@ -125,13 +125,35 @@ wiring, and TPOT matched to within 0.6% at every batch (11.85 / 15.0 / 28.8 /
 45.2 ms at batch 1 / 8 / 32 / 64). That is what licenses trusting the prefill
 delta -- the harness resolves no spurious difference.
 
-**Open, not cleared: greedy outputs diverge.** At temperature 0 the two arms
-separate after 4, 5 and 26 tokens on three prompts; both stay coherent and
-on-topic. This is not evidence that this kernel is worse -- against an fp32
-oracle it is the *more* accurate of the two (0.9999979 against FlashInfer's
-0.9998678), so token agreement with arm A is the wrong acceptance test. But
-"different from a less accurate baseline" is not the same as "harmless", and the
-task-metric comparison that would settle it has not been run yet.
+**Model accuracy: cleared on the measurement that matters.** GSM8K, 400
+questions, 5-shot, temperature 0, two repetitions per arm, same servers:
+
+    arm A (FlashInfer baseline)   0.968  0.953   mean 0.9605   invalid 0.000
+    arm B (this kernel)           0.960  0.970   mean 0.9650   invalid 0.000
+
+The spread *within* each arm (1.5 and 1.0 points) is larger than the difference
+*between* them (0.45 points), and this kernel is nominally the higher of the
+two. vLLM publishes 95.0% for DeepSeek-V4 on this hardware class, so both arms
+are healthy. Four runs, zero invalid outputs.
+
+Two things that are true alongside that, and are not swept up in it:
+
+* At temperature 0 the arms' greedy continuations separate after 4, 5 and 26
+  tokens. That is expected of two different numerical paths and says nothing on
+  its own -- token agreement with arm A would be the wrong test in any case,
+  since against an fp32 oracle *this* kernel is the more accurate of the two
+  (0.9999979 against FlashInfer's 0.9998678).
+* A teacher-forced logit comparison over three fixed continuations gives top-1
+  agreement of 16/16, 22/24 and 46/47, with mean KL(A||B) of 0.09, 0.19 and
+  0.05. But the three disagreements sit at top-2 margins of ~0.11-0.12, not at
+  near-ties. So the two distributions genuinely differ rather than merely
+  flipping coin-tosses -- which is unsurprising when one arm pads 8 heads into
+  64 and the other does not, and when both are approximations that differ from
+  fp32 in different directions. It does not translate into a task-quality
+  difference, and the oracle comparison says the baseline is the one further
+  from truth, but it is recorded rather than explained away. The sample is
+  small (16-47 positions on three low-constraint prompts); a wider logit study
+  would be the way to close it properly.
 
 Acceptance measurement, SM120, both precisions, both stages
 ------------------------------------------------------------
