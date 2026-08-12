@@ -515,24 +515,57 @@ sm_120 cubin at the pinned BLOCK_N=64:
 
     BLOCK_H  shared     blk/SM  warps/SM  spill   tensor work
     64       82,176 B   1       4         9,104 B  1.00x   <- was shipping
-    32       41,088 B   2       8         1,612 B  1.00x
-    16       31,872 B   3       12          240 B  1.00x   <- now pinned (BLOCK_N=32)
-    8        27,264 B   3       12            0 B  2.00x
+    32       63,744 B   1       4         2,912 B  1.00x
+    16       54,528 B   1       4         1,320 B  1.00x   <- now pinned
+    8        49,920 B   2       8           612 B  2.00x
 
-Tiling to BLOCK_H=16 is **3x the resident warps and 38x less spill traffic at an
-identical mma count** -- not a trade, which is what makes it different from every
-bf16 tile above. BLOCK_H=8 is excluded deliberately: mma's M granularity is 16,
-so an 8-row tile issues the same instructions for half the useful rows. It
-survives only where H itself is 8 and no wider tile is legal.
+The measured win is **1.75-2.88x on decode, gmean 2.12x over batch** (CUDA-graph
+replay, RTX 5080, job 3624701) -- and note what it is *not*. At the inherited
+BLOCK_N=64 the tile that ships now has the same 1 block/SM and the same 4
+warps/SM as the one it replaces, and issues exactly the same number of mma. The
+only thing that moved is the spill: **9,104 B down to 1,320 B**, because the
+eight 64-wide fp32 accumulators are what overran the 255-register cap, and they
+shrink with BLOCK_H. Occupancy is not the mechanism here; register pressure is.
 
-This is a pure indexing change, so tiles agree bit for bit -- verified at h=16,
-32 and 64, through the split-K decode kernel at every (B, splits), and on ragged
-rows. One caveat for whoever adds an arch to `_FP8_MMA_CAPS`: wgmma's M is fixed
-at 64, so on sm_90 BLOCK_H=64 compiles to wgmma (168 of them, zero mma.sync)
-while BLOCK_H<=32 falls back to mma.sync, and the accumulation order differs by
-one to two bf16 ULP. sm_120 has no wgmma -- BLOCK_H 64/32/16 emit 576/288/144
-mma.sync -- so the bitwise claim holds there. Compare tiles within one
-instruction class if a wgmma arch is ever admitted.
+That distinction was worth 17%. The first version of this change also narrowed
+BLOCK_N to 32, which the shared-memory sweep said would buy 3 blocks/SM -- and
+which measured *slower at every batch above 1*, taking gmean 2.12x down to 1.82x.
+See `_PINNED_NATIVE_TILED_BN`, kept empty with the numbers.
+
+BLOCK_H=8 is excluded deliberately: mma's M granularity is 16, so an 8-row tile
+issues the same instructions for half the useful rows -- the one row in the table
+that does buy occupancy, and pays double the tensor work for it. It survives only
+where H itself is 8 and no wider tile is legal.
+
+This is a pure indexing change, and it is bitwise **within a layout family**.
+Triton gives a `[BLOCK_H, BLOCK_N]` tile a `warpsPerCTA` of `[1, 4]` up to
+BLOCK_H=32 and `[4, 1]` at 64, which turns the softmax row reduction
+`tl.sum(p, axis=1)` from a cross-warp tree into an intra-warp one -- same
+arithmetic, different summation order. So 8, 16 and 32 agree bit for bit with
+each other (verified at h=16/32/64, through the split-K decode kernel at every
+(B, splits), and on ragged rows), while 64 sits on the far side of that boundary
+at cos=1.0000000, max|d|=0.0010 -- under one bf16 ULP. What holds across the
+boundary too, and is the property that matters, is that **tiling does not move
+the error**: every tile lands on the same cos and max|d| against the bf16 gather,
+to every digit printed, at every h.
+
+An earlier version of this note blamed wgmma, whose M is fixed at 64 and which
+does flip at exactly that BLOCK_H on sm_90 (168 wgmma, zero mma.sync, against
+mma.sync-only below it). That is a second effect in the same place, not the
+cause: sm_120 has no wgmma at all -- BLOCK_H 64/32/16 emit 576/288/144 mma.sync
+-- and the boundary is still there. It was read off the TTGIR after the sm_120
+run contradicted the guess, which is the only reason it is right now.
+
+Narrowing BLOCK_N alongside the tile was tried and lost -- see
+`_PINNED_NATIVE_TILED_BN`, kept empty with the numbers. Two things it left
+behind. BLOCK_N is the softmax tile width, so changing it is not bitwise
+(cos=0.999976, max|d|=0.0391), which means any tile-vs-tile comparison has to
+pin `config` or it measures the BLOCK_N change and blames tiling -- exactly what
+the first sm_120 run did, and why the tests now pass an explicit config. And the
+shared-memory sweep that motivated it was right about the bytes and wrong about
+the speed: 3 blocks/SM measured *slower* than 1 at every batch above 1. On this
+kernel warps/SM is not the binding constraint an occupancy table makes it look
+like -- the same lesson the bf16 arm got from NCU, arrived at twice.
 
 Three levers the same profile **closes**, so they need not be retried: fp8 for
 the QK dot (tensor subpipe only 25.5% active and math throttle 25.7% of samples,
@@ -3558,14 +3591,20 @@ def _native_config(device, num_heads):
 # rather than one [BLOCK_H, D_V] tile, so its register and smem curves are not
 # the bf16 kernel's.
 #
-# At DeepSeek-V4's padded h=64 the untiled tile is BLOCK_H=64 with the pinned
-# BLOCK_N=64, and on sm_120 that cubin is 82,176 B of shared memory (1 block/SM,
-# 4 warps/SM) and **spills 9,104 B**. Tiling to BLOCK_H=16 with BLOCK_N=32 gives
-# 31,872 B (3 blocks/SM, 12 warps/SM) and 240 B of spill, at an *identical* mma
-# count -- 3x the resident warps and 38x less spill traffic for no extra tensor
-# work. Measured by compiling this kernel for sm_120 ahead of time and reading
-# `metadata.shared` plus ptxas -v (probe/aot_sm120_native.py); the method and
-# its two traps are in probe/README_DSV4_SM120.md.
+# At DeepSeek-V4's padded h=64 the untiled tile is BLOCK_H=64 at the pinned
+# BLOCK_N=64, and on sm_120 that cubin **spills 9,104 B**: the eight 64-wide fp32
+# accumulators overrun the 255-register cap, and they scale with BLOCK_H. Tiling
+# to BLOCK_H=16 at the same BLOCK_N drops that to 1,320 B for an identical mma
+# count, and measures **gmean 2.12x on decode** (1.75-2.88x over batch, CUDA-graph
+# replay, RTX 5080, job 3624701).
+#
+# Occupancy is not the mechanism: both tiles are 1 block/SM and 4 warps/SM. The
+# variant that *did* buy occupancy -- BLOCK_N narrowed to 32 for 3 blocks/SM --
+# measured slower at every batch above 1. See `_PINNED_NATIVE_TILED_BN`.
+#
+# Resources read by compiling for sm_120 ahead of time (`metadata.shared` plus
+# ptxas -v, probe/aot_sm120_native.py); the method and its traps are in
+# probe/README_DSV4_SM120.md.
 #
 # BLOCK_H=8 is deliberately absent: mma's M granularity is 16, so an 8-row tile
 # issues the same instructions for half the useful rows (2.00x the tensor work
@@ -3579,10 +3618,22 @@ _PINNED_NATIVE_HEAD_TILE: dict = {
     (12, 0): {32: 16, 64: 16},
 }
 
-# BLOCK_N pinned alongside the head tile: at BLOCK_H=16 the sm_120 sweep puts
-# 32 at 31,872 B against 54,528 B for 64, which is the difference between 3
-# blocks/SM and 1. `_NATIVE_TILE`'s 64 was swept at the untiled BLOCK_H=64.
-_PINNED_NATIVE_TILED_BN: dict = {(12, 0): 32}
+# Narrowing BLOCK_N alongside the head tile was tried and **lost**; the table is
+# kept empty so the negative result is not re-derived.
+#
+# The case for it was the shared-memory sweep: at BLOCK_H=16 on sm_120, BLOCK_N
+# 32 compiles to 31,872 B (3 blocks/SM) against 54,528 B for 64 (1 block/SM).
+# Measured under CUDA-graph replay at DSv4's decode shape it is slower at every
+# batch above 1 -- 0.91x at B=2, 0.83x at 16, 0.78x at 32, 0.72x at 128 (job
+# 3624701, RTX 5080). Head tiling alone at the inherited BLOCK_N=64 is gmean
+# 2.12x over B against the untiled tile; adding this pin drops that to 1.82x.
+#
+# Occupancy on paper lost to the wider reduction tile, which is the same lesson
+# the bf16 arm learned from NCU: on this kernel warps/SM is not the binding
+# constraint that a shared-memory table makes it look like. Leaving it empty
+# also keeps the tiled path on the *same* BLOCK_N as the untiled one, which is
+# what makes the shipped default bitwise-comparable to it.
+_PINNED_NATIVE_TILED_BN: dict = {}
 
 
 def _native_head_tile(device, num_heads, mono, override=None):

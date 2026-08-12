@@ -33,6 +33,14 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 D_QK, D_V, SM_SCALE = 576, 512, 0.0625
 
+# Widest head tile that still shares a layout with the narrower ones. Triton
+# gives a [BLOCK_H, BLOCK_N] tile warpsPerCTA [1, 4] up to here and [4, 1] above
+# it, which reverses the softmax row reduction from a cross-warp tree to an
+# intra-warp one -- same arithmetic, different summation order, so results are
+# bitwise comparable only within a family. Read off the TTGIR at BLOCK_H
+# 8/16/32/64 for sm_120 (probe/aot_sm120_native.py).
+_LAYOUT_FAMILY = 32
+
 
 def _reference(q, kv, indices, d_v=D_V, attn_sink=None):
     """fp32 reference: each token attends over its own valid selected rows.
@@ -726,15 +734,29 @@ class TestNativePagedFP8(CustomTestCase):
         order, different program -- so every tile must agree with the untiled
         launch bit for bit.
 
-        Both members of `_FP8_MMA_CAPS` (sm_89, sm_120) issue mma.sync at every
-        BLOCK_H, which is what makes the bitwise claim hold. Should a wgmma arch
-        ever be admitted, note that wgmma's M is fixed at 64: BLOCK_H=64 would
-        then compile to a different instruction class than BLOCK_H<=32 and the
-        last bf16 bit would differ for reasons unrelated to tiling. Compare
-        tiles within one class if that day comes.
+        Two things have to be held still for that claim to mean anything.
+
+        **BLOCK_N.** The wrapper pins a narrower BLOCK_N when it tiles (see
+        `_PINNED_NATIVE_TILED_BN`), and BLOCK_N is the softmax tile width, so
+        letting it move compares two different reductions. Hence the explicit
+        `config` on both arms. Without it this test passes on an unswept device,
+        where no pin fires, and fails on sm_120.
+
+        **The tile layout family.** Triton gives a `[BLOCK_H, BLOCK_N]` tile a
+        `warpsPerCTA` of `[4, 1]` at BLOCK_H=64 but `[1, 4]` at BLOCK_H<=32, so
+        the row reduction `tl.sum(p, axis=1)` is intra-warp at 64 and a
+        cross-warp tree below it. Same arithmetic, different summation order,
+        so the last bf16 bit moves across that boundary and only across it --
+        8, 16 and 32 agree with each other exactly. That is why the bitwise
+        assertion runs inside `_LAYOUT_FAMILY` and the 64 case is covered by
+        `test_head_tile_across_layout_families` instead. (On sm_90 the same
+        boundary also flips mma.sync to wgmma, whose M is fixed at 64. That is a
+        second effect at the same place, not the cause: sm_120 has no wgmma and
+        the boundary is still there.)
         """
         native = self._entry()
         S, PAGE, topk = 2048, 256, 640
+        CFG = (64, 4, 2)  # (BLOCK_N, warps, stages), pinned so only BLOCK_H moves
         pool, _ = _build_paged_fp8_pool(S, PAGE, seed=13)
         for h in (16, 32, 64):
             g = torch.Generator(device="cuda").manual_seed(h)
@@ -743,25 +765,61 @@ class TestNativePagedFP8(CustomTestCase):
             )
             idx = _random_indices(96, topk, S, g)
             sink = torch.randn(h, dtype=torch.float32, device="cuda", generator=g)
-            ref = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink, block_h=h)
-            for tile in (8, 16, 32):
-                if tile >= h:
-                    continue
+            family = [t for t in (8, 16, 32) if t <= min(h, _LAYOUT_FAMILY)]
+            ref = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
+                         block_h=family[-1], config=CFG)
+            for tile in family[:-1]:
                 with self.subTest(h=h, block_h=tile):
-                    got = native(
-                        q, pool, idx, SM_SCALE, PAGE, attn_sink=sink, block_h=tile
-                    )
+                    got = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
+                                 block_h=tile, config=CFG)
                     self.assertTrue(
                         torch.equal(ref, got),
-                        f"native head tile {tile} diverged from untiled at h={h}",
+                        f"native head tile {tile} diverged from {family[-1]} "
+                        f"at h={h}, inside one layout family",
                     )
+
+    def test_head_tile_across_layout_families(self):
+        """Across the BLOCK_H=64 layout boundary the outputs are not bitwise --
+        the row reduction changes order -- but tiling must still not *move* the
+        error. Both tiles have to land on the same distance from the reference.
+        """
+        native = self._entry()
+        S, PAGE, topk = 2048, 256, 640
+        CFG = (64, 4, 2)
+        pool, kv = _build_paged_fp8_pool(S, PAGE, seed=29)
+        g = torch.Generator(device="cuda").manual_seed(31)
+        q = torch.randn(96, 64, 512, dtype=torch.bfloat16, device="cuda", generator=g)
+        idx = _random_indices(96, topk, S, g)
+        sink = torch.randn(64, dtype=torch.float32, device="cuda", generator=g)
+        ref = sparse_mla_prefill(q, kv, idx, SM_SCALE, 512, attn_sink=sink)
+
+        wide = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
+                      block_h=64, config=CFG)
+        narrow = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
+                        block_h=16, config=CFG)
+        # A reduction-order difference, so a handful of bf16 ULP at most.
+        _assert_matches(self, narrow, wide, "native BLOCK_H 16 vs 64",
+                        cos_min=0.99999, max_abs=0.02)
+
+        def err(o):
+            c = torch.nn.functional.cosine_similarity(
+                o.float().flatten(), ref.float().flatten(), dim=0).item()
+            return round(c, 6), round((o.float() - ref.float()).abs().max().item(), 6)
+
+        self.assertEqual(
+            err(narrow), err(wide),
+            "head tiling moved the error against the bf16 gather; it must only "
+            "reorder the reduction, not change the result",
+        )
 
     def test_head_tile_matches_untiled_split(self):
         """Same, through the split-K decode kernel. The partials are addressed
         as `mid_o[t, h, s, :]` with an absolute h, so tiling must leave both the
-        layout and the merge untouched."""
+        layout and the merge untouched. BLOCK_N is pinned, and the tiles compared
+        stay inside `_LAYOUT_FAMILY`, for the reasons given above."""
         native = self._entry()
         S, PAGE, topk = 2048, 256, 640
+        CFG = (64, 4, 2)
         pool, _ = _build_paged_fp8_pool(S, PAGE, seed=17)
         for B in (1, 32):
             for splits in (1, 4, 10):
@@ -776,16 +834,48 @@ class TestNativePagedFP8(CustomTestCase):
                     )
                     ref = native(
                         q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
-                        splits=splits, block_h=64,
+                        splits=splits, block_h=_LAYOUT_FAMILY, config=CFG,
                     )
                     got = native(
                         q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
-                        splits=splits, block_h=16,
+                        splits=splits, block_h=16, config=CFG,
                     )
                     self.assertTrue(
                         torch.equal(ref, got),
                         f"native split head tile diverged at B={B} S={splits}",
                     )
+
+    def test_tiled_block_n_is_not_bitwise(self):
+        """The BLOCK_N the wrapper pins when it tiles is a *separate* change
+        from tiling, and it is deliberately not bitwise: BLOCK_N is the softmax
+        tile width, so narrowing it moves the reduction boundaries. Asserted so
+        that nobody later "fixes" the divergence the default path shows on a
+        swept device by reverting the pin.
+        """
+        native = self._entry()
+        S, PAGE, topk = 2048, 256, 640
+        cap = torch.cuda.get_device_capability()
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            _PINNED_NATIVE_TILED_BN,
+        )
+
+        if cap not in _PINNED_NATIVE_TILED_BN:
+            self.skipTest("no BLOCK_N pin on this device, nothing to separate")
+        pool, _ = _build_paged_fp8_pool(S, PAGE, seed=19)
+        g = torch.Generator(device="cuda").manual_seed(23)
+        q = torch.randn(64, 64, 512, dtype=torch.bfloat16, device="cuda", generator=g)
+        idx = _random_indices(64, topk, S, g)
+        sink = torch.randn(64, dtype=torch.float32, device="cuda", generator=g)
+        wide = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink,
+                      block_h=16, config=(64, 4, 2))
+        narrow = native(q, pool, idx, SM_SCALE, PAGE, attn_sink=sink, block_h=16)
+        self.assertFalse(
+            torch.equal(wide, narrow),
+            "BLOCK_N pin did not fire -- the tiled path is not using it",
+        )
+        # Not bitwise, but the two must still be the same computation.
+        _assert_matches(self, narrow, wide, "tiled BLOCK_N 32 vs 64",
+                        cos_min=0.9999, max_abs=0.02)
 
     def test_head_tile_default_is_pinned_only_where_swept(self):
         """An arch with no `_PINNED_NATIVE_HEAD_TILE` entry must keep the
