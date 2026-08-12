@@ -457,6 +457,53 @@ S=8192 pool rows:
   fp32 accumulator it rescales and writes every iteration. Halving it is what
   ``_PINNED_NARROW_H`` buys, and it is worth 1.27-1.47x.
 
+On vLLM, and what it says about where the advantage comes from
+----------------------------------------------------------------
+Measured inside vLLM 0.27.1's own environment (torch 2.13.0+cu130, flashinfer
+0.6.16.post3, its own pin) on one RTX PRO 6000, against the kernel vLLM
+dispatches on SM120 -- FlashInfer's `_sparse_mla_sm120`, the same one SGLang
+uses. Prefill, eager (vLLM does not graph-capture prefill), T=2048/4096/8192:
+
+    heads (TP)   ours paged fp8   ours flat bf16   vs vLLM's own Triton
+      8 (TP8)    FI refuses       FI refuses       2.87 - 10.1x
+     16 (TP4)    1.29 - 1.36x     1.19 - 1.25x     2.18 - 8.6x
+     32 (TP2)    0.71 - 0.74x     1.36 - 1.43x     2.13 - 11.4x
+     64 (TP1)    0.44 - 0.46x     0.91 - 0.97x     1.22 - 6.6x
+
+Decode, under graph replay: 1.29-1.60x at h=8, 1.34-1.56x at h=16, 0.80-1.08x
+at h=32. Decode is the one place FlashInfer accepts 8 heads, so TP8 decode is a
+real head-to-head rather than an enablement.
+
+**vLLM does not pad the head count.** Its SM120 route pads to the smallest
+member of `(8, 16, 32, 64, 128)` at or above the real count, and DeepSeek-V4's
+64 heads divide evenly at every TP, so the factor is 1.00x throughout. The
+largest single source of the SGLang win is therefore absent by construction
+here, and what is measured above is the rest of the design.
+
+**And at TP8 vLLM cannot prefill at all.** FlashInfer's prefill orchestrator has
+no 8-head instantiation (`Unsupported sparse-MLA prefill configuration:
+num_heads=8 ...`, reproduced at page_block_size 64 and 256 and on 0.6.17), and
+vLLM 0.27.1 ships no Triton attention fallback -- `sparse_mla_kernels` is absent
+from the wheel and the DSv4 selector returns the FlashInfer class unconditionally
+on major==12. So at the TP the vendor recipe specifies for 8x RTX PRO 6000, this
+kernel is an enablement rather than a speedup. If vLLM instead padded 8 -> 16
+there (three lines, and legal), FlashInfer would cost 1.738 ms at T=8192 against
+our unpadded 0.965 ms: 1.80x.
+
+Accuracy, cosine against an fp32 oracle over the dequantised stored KV at h=16,
+T=8192: **ours flat bf16 0.9999973** against FlashInfer's 0.9997166 -- about
+100x closer to fp32 -- with our paged-fp8 arm at 0.9996866, consistent with the
+double-quantisation account above. vLLM's own Triton kernel over the same
+workspace also reaches 0.9999973, which is independent evidence the workspace
+and index construction are right.
+
+Two corrections to assumptions that were made here earlier. vLLM's SM120 route
+does **not** hand us a flat `kv` plus combined indices -- that is its SM90/SM100
+path; SM120 passes two paged pools and two index arrays, and building the flat
+workspace costs 0.034-0.035 ms per layer, small but not free. And both DSv4
+pools are **64 tokens per page**, not 256; FlashInfer's decode dispatch requires
+64 and silently falls through to the prefill orchestrator at 256.
+
 The advantage is a function of head count, and it reverses above ~32
 --------------------------------------------------------------------------
 Everything else in this file was measured at h=8, DeepSeek-V4's post-TP8 count.
