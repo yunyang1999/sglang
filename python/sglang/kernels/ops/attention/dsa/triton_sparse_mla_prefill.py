@@ -457,6 +457,73 @@ S=8192 pool rows:
   fp32 accumulator it rescales and writes every iteration. Halving it is what
   ``_PINNED_NARROW_H`` buys, and it is worth 1.27-1.47x.
 
+Why head-tiling actually works, and the 128 bytes that would pay next
+-----------------------------------------------------------------------
+The account given below for head-tiling -- that the `[BLOCK_H, d_v]`
+accumulator pins occupancy to 1 block/SM -- is **wrong about the mechanism**,
+though right about the root cause. Nsight Compute on both arms at h=16 and h=64
+says so directly: the *winning* configuration has **half** the occupancy of the
+losing one (1.001 warps/scheduler at h=16 against 2.001 at h=64), so occupancy
+cannot be what separates them.
+
+What separates them is that **the monolithic h=64 kernel issues exactly 2.5x
+the tensor ops the algorithm needs** -- 214,748,364,800 against a requirement of
+85,899,345,920, while the h=16 kernel issues exactly 1.000x. The cause is a
+Triton mma-layout artefact: `_PINNED_WIDE_H` gives BLOCK_N=16 with 8 warps, the
+QK dot's N=16 is only two mma n-tiles, and eight warps at `instrShape [16, 8]`
+span 64 -- so eight warps compute two n-tiles **four times over**. Confirmed
+three independent ways: 160 `mma.sync` in the PTX where 128 suffice, 128 static
+HMMA PCs at the QK-dot line against 32 at the PV-dot line, and the counter
+matching 1280 x 40 x 1024 x 4096 to the last digit. The PC histogram shows it
+costing real time -- the two dots carry identical FLOPs, and at h=16 they cost
+21.2% and 16.1% of issue-stall samples, but at h=64 the QK dot costs 4.3x the PV
+dot (59.3% against 10.7%), with `math_pipe_throttle` at 57.9%.
+
+The accumulator is still the root cause, one step removed. At BLOCK_H=64 it is
+64*512*4 B, which over 128 threads is 256 registers per thread against a 255 cap
+-- the 4-warp cubins duly carry a 432-480 B stack frame. So 8 warps are forced;
+and with 8 warps, avoiding the replication needs the QK output N >= 64, i.e.
+BLOCK_N >= 64, which needs 139,520 B of shared memory against a 101,376 B
+budget. **On SM120 there is no BLOCK_H=64 tile that is simultaneously
+non-spilling and non-replicating.** That is why the 96-config sweep found
+nothing and why the grid was the only axis left. Removing 60% of the tensor ops
+in a kernel 57.9% math-throttled predicts 1.6-1.8x; the delivered 0.67 -> 1.20
+is 1.79x.
+
+**The next lever is 128 bytes.** The head-tiled kernel at h=64 compiles to
+exactly the profiled h=16 kernel, run on grid (T, 4), so its profile is the new
+baseline: `launch__occupancy_limit_shared_mem = 1` while
+`launch__occupancy_limit_registers = 2` -- shared memory is the *sole* limiter --
+with 1.001 warps/scheduler, `wait` at 42.2%, and NCU estimating 63.3% from both
+Theoretical Occupancy and Issue Slot Utilisation. Two blocks/SM needs dynamic
+shared <= 50,176 B. The BLOCK_H=16 / BLOCK_N=32 / 4-warp cubin is **50,304 B**:
+Q 16,384 + KV 32,768 + P 1,024 + **idx 128**. It misses by exactly the 128-byte
+index staging buffer, and its mma count is already the algorithmic minimum.
+Finding those 128 bytes -- stopping the pipeliner staging `idx` in smem, or
+folding the 32-entry index tile into the P round trip -- is worth an estimated
+**1.15-1.30x** (ceilings: 1.63x from issue slots, 2.3x from the tensor pipe at
+43.5% cycles-active). Not bitwise identical: the softmax tile boundaries move.
+
+Three levers the same profile **closes**, so they need not be retried: fp8 for
+the QK dot (tensor subpipe only 25.5% active and math throttle 25.7% of samples,
+so halving QK tensor cycles saves at most ~11% -- and the gather side of that
+trade was already measured going the wrong way); the fp32 accumulator rescale
+(`sm__pipe_fma_cycles_active` is **2.23%** of peak, NCU estimates 1.1%, so the
+37% attributed to "PV accumulate" at h=8 does not survive at BLOCK_H=16); and
+register pressure or `maxnreg` (204 registers, register limit already 2 blocks,
+zero spills anywhere).
+
+And two things about FlashInfer worth recording, because they invert the story
+told below. **We amortise the gather better than it does, and still lost at
+h=64**: from h=16 to h=64 its L2 read sectors grow 2.08x (it splits each token
+across two blocks, gathering 1280 rows per token against our 640) while ours
+grow 1.07x. The entire loss was the tensor pipe -- 3.20x its tensor cycles. What
+it does have is **43.75% of its tensor ops on the fp8 pipe**, reading the stored
+fp8 directly, where we issue zero fp8 tensor ops off a dequantised workspace. It
+is otherwise the more wasteful kernel by a wide margin: 81.3M shared-memory bank
+conflicts against our 676, 38-41% excessive global sectors against our 0, and it
+runs 5.6x above its own tensor floor to our 4.2x.
+
 On vLLM, and what it says about where the advantage comes from
 ----------------------------------------------------------------
 Measured inside vLLM 0.27.1's own environment (torch 2.13.0+cu130, flashinfer
