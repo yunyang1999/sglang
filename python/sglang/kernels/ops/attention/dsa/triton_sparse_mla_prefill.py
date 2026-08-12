@@ -94,6 +94,45 @@ T=4096, h=8, d_qk=d_v=512, combined topk=640):
   0.98x at 4096, 0.99x at 8192. Leave it off for DSv4; the exact-set guard makes
   enabling it harmless but pointless.
 
+End to end, served, 8x RTX PRO 6000 Blackwell (sm_120), TP8
+------------------------------------------------------------
+The real 150 GB DeepSeek-V4-Flash, both arms serving, `exit=0`. Arm A is the
+stock SM120 route -- FlashInfer `_sparse_mla_sm120` with heads padded 8 -> 64.
+Arm B routes prefill here with 8 real heads and no padding, and is charged for
+the workspace build it needs.
+
+    input_len   A TTFT ms   B TTFT ms   A/B      A tok/s   B tok/s
+    2048         293.10      254.25     1.153x    6987      8055
+    4096         574.74      491.64     1.169x    7127      8331
+    8192        1130.81      961.73     1.176x    7244      8518
+
+Run-to-run spread is <= 3 ms against gaps of 39-169 ms, and the advantage grows
+with length. **Roughly a third to a half of the kernel-level win survives to end
+to end** (1.15-1.18x against 1.5-2.3x); the rest is amortised across MoE, the
+indexer, and arm B's workspace build.
+
+Which kernel ran is measured, not inferred -- per-call counters inside the
+dispatch, max across TP ranks:
+
+    counter                          arm A            arm B
+    sparse_mla_prefill (this file)       0            9050 @ heads=8
+    sm120_attn_flashinfer            10696            1548  (decode)
+    flash_mla_with_kvcache_sm120     10697 @ h=64     1548  @ h=64
+    flash_mla_with_kvcache_cuda          0               0
+
+Decode was a **harness control, not a result**: both arms ran identical decode
+wiring, and TPOT matched to within 0.6% at every batch (11.85 / 15.0 / 28.8 /
+45.2 ms at batch 1 / 8 / 32 / 64). That is what licenses trusting the prefill
+delta -- the harness resolves no spurious difference.
+
+**Open, not cleared: greedy outputs diverge.** At temperature 0 the two arms
+separate after 4, 5 and 26 tokens on three prompts; both stay coherent and
+on-topic. This is not evidence that this kernel is worse -- against an fp32
+oracle it is the *more* accurate of the two (0.9999979 against FlashInfer's
+0.9998678), so token agreement with arm A is the wrong acceptance test. But
+"different from a less accurate baseline" is not the same as "harmless", and the
+task-metric comparison that would settle it has not been run yet.
+
 Acceptance measurement, SM120, both precisions, both stages
 ------------------------------------------------------------
 RTX 5080, DeepSeek-V4 shape (d=512, swa 128 + c4 512, h=8 after TP8, attn_sink),
