@@ -833,6 +833,18 @@ def _nsa_prefill_kernel(
     # softmax denominator but contributes no value row.
 ):
     t = tl.program_id(0)
+    # Head tile. grid dim 1 is ceil(H / BLOCK_H): one program per (token, head
+    # tile) rather than per token. Every use of `h` below is an ABSOLUTE head
+    # index -- into q, into the sink, into the output -- so offsetting it here
+    # is the whole change. With BLOCK_H >= H the grid dim is 1, `hb` is 0, and
+    # `h` is exactly `tl.arange(0, BLOCK_H)` as before, which is what makes the
+    # monolithic form bitwise identical to the untiled kernel.
+    #
+    # The trade: the `[BLOCK_H, D_V]` fp32 accumulator shrinks with BLOCK_H (at
+    # H=64 it is 128 of the kernel's 246 registers/thread and pins occupancy to
+    # 1 block/SM), at the cost of re-gathering each token's KV rows once per
+    # head tile. The gather is L2-resident, so on DSv4's shape that trade pays.
+    hb = tl.program_id(1)
     D_TAIL: tl.constexpr = D_QK - D_V
 
     if FP8:
@@ -844,7 +856,7 @@ def _nsa_prefill_kernel(
         qk_scale = sm_scale
         out_scale = 1.0
 
-    h = tl.arange(0, BLOCK_H)
+    h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     hmask = h < H
     dv = tl.arange(0, D_V_PAD)
     # tl.arange cannot express a non-power-of-two value dim, so carry the tile at
@@ -1422,6 +1434,38 @@ _PINNED_NARROW_H = {
 _NARROW_H = 8  # head counts at or below this take the narrow-H entry
 
 
+# Head tiling across the grid: {(cap): {H: HEAD_TILE}}.
+#
+# The kernel runs one program per query token with BLOCK_H covering every head.
+# That is right while the `[BLOCK_H, d_v]` fp32 accumulator is small, and wrong
+# once it is not: at H=64 it is 64*512*4 B over 256 threads = 128 of the
+# kernel's 246 registers/thread, which pins the launch to 1 block/SM (NCU:
+# Block Limit Registers 1, Block Limit Shared Mem 1, achieved occupancy 16.65%).
+# Splitting the head dimension across the grid shrinks the accumulator at the
+# cost of re-gathering each token's KV rows once per tile -- L2-resident, 77.6%
+# hit, so the re-read is cheap relative to what the smaller accumulator buys.
+#
+# Conservative by construction, exactly like _PINNED_NARROW_H: an (arch, H) not
+# listed here stays monolithic, so no untuned device or head count silently
+# changes shape. Entries are added only from a measured sweep.
+#
+# Why this is a grid change and not a tile change: the whole 96-config
+# (BLOCK_H, BLOCK_N, warps, stages) sweep recorded in this file holds
+# BLOCK_H == H and varies the tile. Re-sweeping (BLOCK_N, warps, stages) at
+# H=64 finds the pinned (16, 8, 2) already optimal at every T, so the tile space
+# is exhausted; the grid shape is a different axis and had not been tried.
+_PINNED_HEAD_TILE: dict = {
+    # RTX 5080 / 5090 / PRO 6000 Blackwell, DeepSeek-V4 shape. Measured against
+    # FlashInfer's SM120 route at T=512/1024/2048/4096; tile 16 wins at every T
+    # for both head counts, tile 8 always loses (an 8x re-gather is too much) and
+    # tile 32 does not compile to a usable shape here. H<=16 stays monolithic:
+    # the tile would equal H and the grid dim collapses to 1.
+    (12, 0): {32: 16, 64: 16},
+    (12, 1): {32: 16, 64: 16},
+}
+
+
+
 def _narrow_h(device, num_heads):
     """Whether this device+head count has a measured sub-16 BLOCK_H entry."""
     return (
@@ -1436,6 +1480,26 @@ def _block_h(device, num_heads):
     below it -- an unswept arch must not silently change tile."""
     floor = 8 if _narrow_h(device, num_heads) else 16
     return max(floor, triton.next_power_of_2(num_heads))
+
+
+def _head_tile(device, num_heads, mono, override=None):
+    """Head rows per program.
+
+    Returns ``mono`` -- the resolved ``_block_h``, i.e. one program per token
+    with every head in it -- unless this (arch, head count) has a measured
+    entry in ``_PINNED_HEAD_TILE``. An override of 0 or None means "use the
+    table"; any other value is taken literally, which is what the sweep uses.
+
+    The returned value is always a power of two and never exceeds ``mono``, so
+    the default reproduces the untiled kernel exactly.
+    """
+    if override:
+        tile = min(int(override), mono)
+    else:
+        cap = torch.cuda.get_device_capability(device)
+        tile = _PINNED_HEAD_TILE.get(cap, {}).get(num_heads, mono)
+    tile = max(1, min(triton.next_power_of_2(tile), mono))
+    return tile
 
 
 def _config(device, num_heads=None):
@@ -1501,6 +1565,7 @@ def sparse_mla_prefill(
     dense_config=None,
     int64_indexing=None,
     block_h=None,
+    head_tile=None,
     splits=1,
     partial_dtype=torch.bfloat16,
 ):
@@ -1660,9 +1725,18 @@ def sparse_mla_prefill(
         _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, d_v, splits)
         return out
 
+    # Head tiling. `tile == block_h` is one program per token with every head in
+    # it -- the untiled kernel, bitwise. Below that, grid dim 1 splits the head
+    # dimension and the per-program accumulator shrinks with it; the tile's own
+    # head count is then what picks (BLOCK_N, warps, stages), because that is
+    # the shape the program actually runs.
+    tile_h = _head_tile(q.device, h, block_h, head_tile)
+    n_head_tiles = triton.cdiv(h, tile_h)
+    if n_head_tiles > 1:
+        bn, warps, stages = config or _config(q.device, tile_h)
     for bn_try, ns_try in _smem_fallbacks(bn, stages):
         try:
-            _nsa_prefill_kernel[(T,)](
+            _nsa_prefill_kernel[(T, n_head_tiles)](
                 q_in,
                 kv_in,
                 indices,
@@ -1676,7 +1750,7 @@ def sparse_mla_prefill(
                 topk,
                 kv_in.shape[0],
                 H=h,
-                BLOCK_H=block_h,
+                BLOCK_H=tile_h,
                 D_QK=d_qk,
                 D_V=d_v,
                 D_V_PAD=triton.next_power_of_2(d_v),
