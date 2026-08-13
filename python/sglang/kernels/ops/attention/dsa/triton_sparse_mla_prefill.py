@@ -3717,7 +3717,12 @@ def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile):
         "the paged cache must be dense along its last dimension "
         f"(got stride {u8.stride()})"
     )
-    assert u8.dim() == 2, f"expected [pages, bytes_per_page], got {tuple(u8.shape)}"
+    # Rank is not fixed either. The backend reshapes the same slice to
+    # `[pages, page_size, 1, k_cache_total_dim]` before the call, so only two
+    # things are required of the tensor: dim 0 indexes pages, and the last
+    # dimension is dense. `view(torch.uint8)` rescales the strides with the
+    # dtype, so `u8.stride(0)` is the page-to-page distance in bytes whatever
+    # the rank is.
     row_bytes = d_nope + d_rope * 2
     return (
         u8.view(_FP8_DTYPE),
