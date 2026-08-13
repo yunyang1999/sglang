@@ -2690,50 +2690,64 @@ def _nsa_decode_merge_kernel(
     D_V: tl.constexpr,
     D_V_PAD: tl.constexpr,
     SPLIT_PAD: tl.constexpr,  # next power of two >= splits; tl.arange needs one
+    BLOCK_HH: tl.constexpr,  # heads merged per program
     HAS_SINK: tl.constexpr,
 ):
-    """One program per (token, head). Log-domain max over the splits, rescale,
-    sum, fold the sink in once, divide once."""
+    """Log-domain max over the splits, rescale, sum, fold the sink in once,
+    divide once -- for ``BLOCK_HH`` heads of one token.
+
+    One program per (token, head) is what this used to be, and NCU says that is
+    too fine: at B=8 it launches 8 x 64 = 512 programs that each reduce
+    ``splits x 512`` values, runs at 42% of peak bandwidth, and costs 7.6 us
+    against the split kernel's 21.9 -- **26% of the whole decode attention**, and
+    32% at B=4. The heads are independent, so merging several per program
+    amortises the launch and the index setup without widening any tile: the loop
+    below is `static_range`, so the register footprint is one head's worth
+    whatever ``BLOCK_HH`` is. At ``BLOCK_HH=1`` this is the old kernel exactly.
+    """
     t = tl.program_id(0)
-    hh = tl.program_id(1)
+    hb = tl.program_id(1)
 
     sp = tl.arange(0, SPLIT_PAD)
     spm = sp < splits
     dv = tl.arange(0, D_V_PAD)
     vmask = dv < D_V
 
-    base = (t * H + hh).to(tl.int64) * splits + sp
-    m_all = tl.load(mid_m_ptr + base, mask=spm, other=-float("inf"))
-    l_all = tl.load(mid_l_ptr + base, mask=spm, other=0.0)
+    for i in tl.static_range(BLOCK_HH):
+        hh = hb * BLOCK_HH + i
+        if hh < H:
+            base = (t * H + hh).to(tl.int64) * splits + sp
+            m_all = tl.load(mid_m_ptr + base, mask=spm, other=-float("inf"))
+            l_all = tl.load(mid_l_ptr + base, mask=spm, other=0.0)
 
-    gm = tl.max(m_all, axis=0)
-    if HAS_SINK:
-        # The sink is a raw natural-log logit joining the denominator without a
-        # value row; it enters the global max so exp(sink - gm) cannot overflow
-        # when every real logit sits far below it. Exactly once, here -- the
-        # split kernel never sees it.
-        sink = tl.load(sink_ptr + hh).to(tl.float32)
-        gm = tl.maximum(gm, sink)
-    gm = tl.where(gm == -float("inf"), 0.0, gm)
+            gm = tl.max(m_all, axis=0)
+            if HAS_SINK:
+                # The sink is a raw natural-log logit joining the denominator
+                # without a value row; it enters the global max so
+                # exp(sink - gm) cannot overflow when every real logit sits far
+                # below it. Exactly once, here -- the split kernel never sees it.
+                sink = tl.load(sink_ptr + hh).to(tl.float32)
+                gm = tl.maximum(gm, sink)
+            gm = tl.where(gm == -float("inf"), 0.0, gm)
 
-    w = tl.where(m_all == -float("inf"), 0.0, tl.exp(m_all - gm))
-    den = tl.sum(w * l_all, axis=0)
-    if HAS_SINK:
-        den += tl.exp(sink - gm)
+            w = tl.where(m_all == -float("inf"), 0.0, tl.exp(m_all - gm))
+            den = tl.sum(w * l_all, axis=0)
+            if HAS_SINK:
+                den += tl.exp(sink - gm)
 
-    a = tl.load(
-        mid_o_ptr + base[:, None] * D_V + dv[None, :],
-        mask=spm[:, None] & vmask[None, :],
-        other=0.0,
-    )
-    num = tl.sum(w[:, None] * a.to(tl.float32), axis=0)
+            a = tl.load(
+                mid_o_ptr + base[:, None] * D_V + dv[None, :],
+                mask=spm[:, None] & vmask[None, :],
+                other=0.0,
+            )
+            num = tl.sum(w[:, None] * a.to(tl.float32), axis=0)
 
-    den = tl.where(den == 0.0, 1.0, den)
-    tl.store(
-        o_ptr + (t * H + hh).to(tl.int64) * D_V + dv,
-        (num / den).to(o_ptr.dtype.element_ty),
-        mask=vmask,
-    )
+            den = tl.where(den == 0.0, 1.0, den)
+            tl.store(
+                o_ptr + (t * H + hh).to(tl.int64) * D_V + dv,
+                (num / den).to(o_ptr.dtype.element_ty),
+                mask=vmask,
+            )
 
 
 def auto_splits(device, num_tokens, num_heads, topk_total, block_n, block_h,
@@ -2798,9 +2812,51 @@ def _split_ws(device, num_tokens, num_heads, splits, d_v, dtype):
     return ws
 
 
+# Heads merged per program, by capability. See `_nsa_decode_merge_kernel`: one
+# program per (token, head) is too fine, and the heads are independent, so this
+# only trades program count for a static loop. `None`/absent means 1, i.e. the
+# untouched kernel, so an unswept device cannot change behaviour.
+_PINNED_MERGE_HEADS: dict = {}
+
+# Warps for the merge program, and it is worth 5.5% of the whole decode call.
+#
+# NCU puts the merge at L1/TEX 61.11% with DRAM at 36.76% and compute at 15.47%:
+# limited by how the loads issue, not by bandwidth or arithmetic. The tile is
+# [SPLIT_PAD, 512] bf16, so at the old 4 warps each of the 128 threads takes
+# 512/128 = 4 columns = **8 bytes**, half the 16-byte vector the hardware wants.
+# 64 threads take 8 columns = 16 bytes exactly.
+#
+# Measured over the batch mix the e2e run actually decoded at (job 3637870,
+# RTX 5080), as speedup of the whole split+merge call:
+#
+#     B          1      2      4      8     16     32     64   weighted
+#     warps=2  1.000  1.016  1.001  1.221  1.159  1.000  1.000   1.055
+#     warps=1  1.000  1.016  1.001  1.203  1.156  1.000  1.000   1.054
+#     warps=8  0.914  0.723  0.698  0.733  1.054  1.000  1.000   0.809
+#
+# Never worse at any batch, and 1.22x at B=8 -- the merge itself goes from ~7.6
+# to ~2 us there. Above SPLIT_PAD 16 the tile is tall enough that 64 threads is
+# too few and the old rule stands; `auto_splits` cannot reach that at the pinned
+# BLOCK_N=64 (10 tiles -> SPLIT_PAD <= 16), so it is a guard, not a live path.
+_MERGE_WARPS: int = 0
+
+
+def _merge_heads(device, T, h):
+    """Heads per merge program: the largest pinned value that still leaves at
+    least two blocks per SM, so widening the program never empties the grid."""
+    tile = _PINNED_MERGE_HEADS.get(torch.cuda.get_device_capability(device), 1)
+    if tile <= 1:
+        return 1
+    sm = torch.cuda.get_device_properties(device).multi_processor_count
+    while tile > 1 and T * triton.cdiv(h, tile) < 2 * sm:
+        tile //= 2
+    return tile
+
+
 def _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, d_v, splits):
     split_pad = triton.next_power_of_2(splits)
-    _nsa_decode_merge_kernel[(T, h)](
+    hh_tile = _merge_heads(mid_o.device, T, h)
+    _nsa_decode_merge_kernel[(T, triton.cdiv(h, hh_tile))](
         mid_o,
         mid_m,
         mid_l,
@@ -2811,8 +2867,9 @@ def _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, d_v, splits):
         D_V=d_v,
         D_V_PAD=triton.next_power_of_2(d_v),
         SPLIT_PAD=split_pad,
+        BLOCK_HH=hh_tile,
         HAS_SINK=attn_sink is not None,
-        num_warps=4 if split_pad <= 16 else 8,
+        num_warps=_MERGE_WARPS or (2 if split_pad <= 16 else 8),
         num_stages=1,
     )
 
