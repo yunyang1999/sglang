@@ -2691,6 +2691,7 @@ def _nsa_decode_merge_kernel(
     D_V_PAD: tl.constexpr,
     SPLIT_PAD: tl.constexpr,  # next power of two >= splits; tl.arange needs one
     BLOCK_HH: tl.constexpr,  # heads merged per program
+    LOOP_SPLITS: tl.constexpr,  # walk the splits instead of reducing along them
     HAS_SINK: tl.constexpr,
 ):
     """Log-domain max over the splits, rescale, sum, fold the sink in once,
@@ -2720,34 +2721,73 @@ def _nsa_decode_merge_kernel(
             m_all = tl.load(mid_m_ptr + base, mask=spm, other=-float("inf"))
             l_all = tl.load(mid_l_ptr + base, mask=spm, other=0.0)
 
-            gm = tl.max(m_all, axis=0)
-            if HAS_SINK:
-                # The sink is a raw natural-log logit joining the denominator
-                # without a value row; it enters the global max so
-                # exp(sink - gm) cannot overflow when every real logit sits far
-                # below it. Exactly once, here -- the split kernel never sees it.
-                sink = tl.load(sink_ptr + hh).to(tl.float32)
-                gm = tl.maximum(gm, sink)
-            gm = tl.where(gm == -float("inf"), 0.0, gm)
+            if LOOP_SPLITS:
+                # Accumulate over splits in registers instead of reducing a
+                # [SPLIT_PAD, D_V] tile along axis 0.
+                #
+                # The axis-0 form is a *cross-thread* reduction, so Triton
+                # routes it through shared memory, and NCU says that is where
+                # this kernel's time goes: 491,520 excessive shared wavefronts,
+                # **86% of all 569,344**, Est. Speedup 55.63% -- by far the
+                # largest single signal in the whole decode capture. Walking the
+                # splits instead makes every tile 1-D: each thread owns fixed
+                # columns of `acc` and never talks to another thread, so the
+                # shared traffic goes to zero. The per-split scalars are loaded
+                # by every thread from the same address, which is a broadcast,
+                # not a reduction.
+                bs = (t * H + hh).to(tl.int64) * splits
+                gm = tl.max(m_all, axis=0)
+                if HAS_SINK:
+                    sink = tl.load(sink_ptr + hh).to(tl.float32)
+                    gm = tl.maximum(gm, sink)
+                gm = tl.where(gm == -float("inf"), 0.0, gm)
 
-            w = tl.where(m_all == -float("inf"), 0.0, tl.exp(m_all - gm))
-            den = tl.sum(w * l_all, axis=0)
-            if HAS_SINK:
-                den += tl.exp(sink - gm)
+                acc = tl.zeros([D_V_PAD], tl.float32)
+                den = tl.exp(sink - gm) if HAS_SINK else 0.0
+                for s in tl.range(0, splits):
+                    m = tl.load(mid_m_ptr + bs + s).to(tl.float32)
+                    w = tl.where(m == -float("inf"), 0.0, tl.exp(m - gm))
+                    den += w * tl.load(mid_l_ptr + bs + s).to(tl.float32)
+                    acc += w * tl.load(
+                        mid_o_ptr + (bs + s) * D_V + dv, mask=vmask, other=0.0
+                    ).to(tl.float32)
 
-            a = tl.load(
-                mid_o_ptr + base[:, None] * D_V + dv[None, :],
-                mask=spm[:, None] & vmask[None, :],
-                other=0.0,
-            )
-            num = tl.sum(w[:, None] * a.to(tl.float32), axis=0)
+                den = tl.where(den == 0.0, 1.0, den)
+                tl.store(
+                    o_ptr + (t * H + hh).to(tl.int64) * D_V + dv,
+                    (acc / den).to(o_ptr.dtype.element_ty),
+                    mask=vmask,
+                )
+            else:
+                gm = tl.max(m_all, axis=0)
+                if HAS_SINK:
+                    # The sink is a raw natural-log logit joining the
+                    # denominator without a value row; it enters the global max
+                    # so exp(sink - gm) cannot overflow when every real logit
+                    # sits far below it. Exactly once, here -- the split kernel
+                    # never sees it.
+                    sink = tl.load(sink_ptr + hh).to(tl.float32)
+                    gm = tl.maximum(gm, sink)
+                gm = tl.where(gm == -float("inf"), 0.0, gm)
 
-            den = tl.where(den == 0.0, 1.0, den)
-            tl.store(
-                o_ptr + (t * H + hh).to(tl.int64) * D_V + dv,
-                (num / den).to(o_ptr.dtype.element_ty),
-                mask=vmask,
-            )
+                w = tl.where(m_all == -float("inf"), 0.0, tl.exp(m_all - gm))
+                den = tl.sum(w * l_all, axis=0)
+                if HAS_SINK:
+                    den += tl.exp(sink - gm)
+
+                a = tl.load(
+                    mid_o_ptr + base[:, None] * D_V + dv[None, :],
+                    mask=spm[:, None] & vmask[None, :],
+                    other=0.0,
+                )
+                num = tl.sum(w[:, None] * a.to(tl.float32), axis=0)
+
+                den = tl.where(den == 0.0, 1.0, den)
+                tl.store(
+                    o_ptr + (t * H + hh).to(tl.int64) * D_V + dv,
+                    (num / den).to(o_ptr.dtype.element_ty),
+                    mask=vmask,
+                )
 
 
 def auto_splits(device, num_tokens, num_heads, topk_total, block_n, block_h,
@@ -2840,6 +2880,40 @@ _PINNED_MERGE_HEADS: dict = {}
 # BLOCK_N=64 (10 tiles -> SPLIT_PAD <= 16), so it is a guard, not a live path.
 _MERGE_WARPS: int = 0
 
+# Walk the splits in a register accumulation rather than reducing a
+# [SPLIT_PAD, D_V] tile along axis 0. The axis-0 form is a cross-thread
+# reduction, so Triton routes it through shared memory, and NCU counts 491,520
+# excessive shared wavefronts there -- 86% of the kernel's total, Est. Speedup
+# 55.63%, the largest single signal in the whole decode capture.
+#
+# Measured: **1.000x at every batch from 1 to 64** (job 3641367), output
+# equivalent (cos 1.0000000, max|d| 4.9e-4; not bitwise, since a sequential sum
+# replaces a tree). Kept off, and kept in the file, because the estimate was so
+# large and so wrong: after `_MERGE_WARPS` the merge is small enough that its
+# internals do not show up, and NCU's shared-access rule is a generic model that
+# does not know that.
+_MERGE_LOOP_SPLITS: bool = False
+
+# Rejected, and not in the code: fetching a row's whole 8-byte ue8m0 slot in one
+# int64 load instead of one byte per chunk.
+#
+# The arithmetic was right. A row's seven scale bytes are contiguous, and
+# `_kv_chunk` loads them one per chunk, so seven separate loads each request the
+# same 32-byte sector. Counting sector requests per gathered row -- 14 for the
+# 448 fp8 bytes, 4 for the 128-byte rope tail, 7 carrying one byte each --
+#     (448 + 128 + 7) / (25 * 32) = 72.9%
+# against NCU's measured 23.2 of 32 bytes utilised, with Est. Speedup 8.878%.
+# One wide load would take it to 19 requests and 96%.
+#
+# It measured **0.906x** weighted over the decoded batch mix (job 3641581):
+# 0.858x at B=1 and 0.859x at B=2, which between them are 66% of decode steps,
+# turning positive only at B>=16. The int64 load and the shift that follows are
+# a serial dependency, while seven byte loads issue together and L1 absorbs the
+# repeated sector -- so the sector-request count never became time. (It also
+# diverged at B=32, which was not chased once the speed answer was in.)
+# Reverted rather than left behind a flag: it is invasive plumbing through two
+# kernels for a loss.
+
 
 def _merge_heads(device, T, h):
     """Heads per merge program: the largest pinned value that still leaves at
@@ -2868,6 +2942,7 @@ def _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, d_v, splits):
         D_V_PAD=triton.next_power_of_2(d_v),
         SPLIT_PAD=split_pad,
         BLOCK_HH=hh_tile,
+        LOOP_SPLITS=_MERGE_LOOP_SPLITS,
         HAS_SINK=attn_sink is not None,
         num_warps=_MERGE_WARPS or (2 if split_pad <= 16 else 8),
         num_stages=1,
