@@ -12,7 +12,7 @@ One framework-neutral file — module-level imports are `logging`, `torch`,
 
     python/sglang/kernels/ops/attention/dsa/triton_sparse_mla_prefill.py
 
-plus ~165 lines of wiring across three existing files. Both entry points are
+plus ~137 lines of wiring across three existing files. Both entry points are
 off by default and only reachable on SM120:
 
 ```bash
