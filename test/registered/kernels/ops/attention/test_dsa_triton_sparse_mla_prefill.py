@@ -644,6 +644,47 @@ class TestSplitKDecode(CustomTestCase):
                     max_abs=0.01,
                 )
 
+    def test_merge_warps_follows_split_pad(self):
+        # The merge's warp count comes from the height of the tile it reduces,
+        # not from the batch. This guards the shape of that rule rather than its
+        # speed: the numbers behind it were measured on two parts, but a later
+        # edit that inverted it, or that returned 1 for a tall tile, would not
+        # fail any accuracy test here.
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            _merge_warps,
+        )
+
+        for split_pad, want in ((1, 2), (2, 2), (4, 2), (8, 1), (16, 1), (32, 8)):
+            with self.subTest(split_pad=split_pad):
+                self.assertEqual(_merge_warps(split_pad), want)
+
+    def test_merge_warp_count_does_not_move_the_answer(self):
+        # 1 warp is live at SPLIT_PAD >= 8, and the merge reduces along the
+        # splits across threads, so fewer threads means a different reduction
+        # tree. That is allowed to move the last bits; it is not allowed to move
+        # the answer.
+        import sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill as _k
+
+        S, topk, B = 4096, 640, 8
+        q, kv, g = _qkv(B, S, 8, seed=77)
+        idx = _random_indices(B, topk, S, g)
+        sink = torch.randn(8, dtype=torch.float32, device="cuda", generator=g)
+        prev = _k._MERGE_WARPS
+        try:
+            out = {}
+            for w in (1, 2, 4):
+                _k._MERGE_WARPS = w
+                out[w] = sparse_mla_prefill(
+                    q, kv, idx, SM_SCALE, D_V, attn_sink=sink, splits=10
+                )
+            for w in (1, 4):
+                _assert_matches(
+                    self, out[w], out[2], f"merge warps {w} vs 2",
+                    cos_min=0.99999, max_abs=0.02,
+                )
+        finally:
+            _k._MERGE_WARPS = prev
+
     def test_ragged_lengths_survive_splitting(self):
         # A split that lands entirely past a row's valid length must contribute
         # nothing rather than poisoning the merge with an empty softmax.

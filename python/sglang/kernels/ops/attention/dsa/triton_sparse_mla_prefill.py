@@ -2874,11 +2874,52 @@ _PINNED_MERGE_HEADS: dict = {}
 #     warps=1  1.000  1.016  1.001  1.203  1.156  1.000  1.000   1.054
 #     warps=8  0.914  0.723  0.698  0.733  1.054  1.000  1.000   0.809
 #
-# Never worse at any batch, and 1.22x at B=8 -- the merge itself goes from ~7.6
-# to ~2 us there. Above SPLIT_PAD 16 the tile is tall enough that 64 threads is
-# too few and the old rule stands; `auto_splits` cannot reach that at the pinned
-# BLOCK_N=64 (10 tiles -> SPLIT_PAD <= 16), so it is a guard, not a live path.
+# 1.22x at B=8 -- the merge itself goes from ~7.6 to ~2 us there.
+#
+# That table called 1 and 2 warps a tie (1.054 vs 1.055) and 2 was taken. It was
+# wrong, and wrong for a reason worth keeping: **every timing in it is quantised
+# to ~2.05 us**. The values land on 6, 7, 8, 10, 11 and 12 steps of that grid, so
+# shapes differing by less than a step all report as an identical 1.000x, and the
+# one pair that happens to straddle a step reports 1.22x. A per-shape ranking
+# read off that grid is noise wherever the true gap is under one step -- which,
+# for a 2 us kernel, is most of it.
+#
+# Re-measured with the granularity removed (jobs 3659314 on RTX 5080, 3659743 on
+# RTX PRO 6000): 64 merge launches inside one captured graph so fixed per-replay
+# overhead is amortised 64-fold; arms round-robined inside each of 9 trials so
+# clock drift hits them alike; median with min-max instead of best-of; and the
+# merge timed *alone* on synthetic partials rather than through the split kernel
+# that dilutes it. The effect then resolves, and it is not a function of batch at
+# all -- it tracks `SPLIT_PAD`:
+#
+#     SPLIT_PAD      16      8      4      2   <- merge alone, w=1 vs w=2
+#     PRO 6000    1.29x  1.02x    n/a  1.01x
+#     5080        1.26x  1.03x  0.94x  0.96x
+#
+# Which is what the tile shape says it should be: the kernel reduces a
+# [SPLIT_PAD, D_V] tile along axis 0, a cross-thread reduction. At SPLIT_PAD 16
+# that reduction is the work and fewer warps make it cheaper; at 2 there is
+# almost nothing to reduce and the threads are wanted for the 512-wide store.
+#
+# Whole decode call, weighted by the same batch mix: **1.050x on PRO 6000, 1.028x
+# on the 5080**, per-shape min-max spreads disjoint at every winning shape. Taken
+# as a function of SPLIT_PAD rather than a flat 1: flat 1 gives up 0.5% at the
+# 5080's B=10 (SPLIT_PAD 4) for no gain anywhere, while the rule below matches
+# flat-1 on PRO 6000, beats it on the 5080, and is never worse than shipping at
+# any measured shape on either part.
 _MERGE_WARPS: int = 0
+
+
+def _merge_warps(split_pad):
+    """Warps for the merge program, from the height of the tile it reduces.
+
+    Above SPLIT_PAD 16 the tile is tall enough that even 64 threads is too few;
+    `auto_splits` cannot reach that at the pinned BLOCK_N=64 (10 tiles ->
+    SPLIT_PAD <= 16), so that arm is a guard, not a live path.
+    """
+    if split_pad > 16:
+        return 8
+    return 1 if split_pad >= 8 else 2
 
 # Walk the splits in a register accumulation rather than reducing a
 # [SPLIT_PAD, D_V] tile along axis 0. The axis-0 form is a cross-thread
@@ -2944,7 +2985,7 @@ def _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, d_v, splits):
         BLOCK_HH=hh_tile,
         LOOP_SPLITS=_MERGE_LOOP_SPLITS,
         HAS_SINK=attn_sink is not None,
-        num_warps=_MERGE_WARPS or (2 if split_pad <= 16 else 8),
+        num_warps=_MERGE_WARPS or _merge_warps(split_pad),
         num_stages=1,
     )
 
