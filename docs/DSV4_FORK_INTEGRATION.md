@@ -30,11 +30,11 @@ git apply dsv4-sm120-triton-sparse-mla.patch
 
 | file | lines | what |
 |---|---|---|
-| `.../dsa/triton_sparse_mla_prefill.py` | +4140 | the kernel (new file) |
+| `.../dsa/triton_sparse_mla_prefill.py` | +4181 | the kernel (new file) |
 | `srt/environ.py` | +21 | the switches |
 | `srt/layers/attention/deepseek_v4_backend.py` | +99/-9 | decode/prefill dispatch |
 | `srt/models/deepseek_v4.py` | +17 | skip head padding on the Triton prefill route |
-| `test/.../test_dsa_triton_sparse_mla_prefill.py` | +963 | 33 tests |
+| `test/.../test_dsa_triton_sparse_mla_prefill.py` | +1004 | 35 tests |
 
 The patch is cut **against your `2538def09`, from the tree that produced the
 numbers below** — not rebased from ours, which had drifted from yours in
@@ -98,6 +98,15 @@ Routing is confirmed by path counters rather than by the flags: arm A takes
 FlashInfer 817 times and this kernel zero, arm B takes this kernel and
 FlashInfer **zero**.
 
+**These numbers understate the kernel you are being given.** The e2e ran before
+two later merge changes: 4 → 2 warps (1.055x on the decode call) and then the
+SPLIT_PAD-indexed count (a further 1.050x), together ~1.11x on the attention
+call. Folding that through the attention share derived below (6.4-8.0% of a
+decode step) puts another **0.6-0.8% of TPOT** on top of the table above — so
+the true figure is nearer 0.953-0.980 than 0.959-0.987. That is an estimate from
+two measured quantities, not a measurement; we did not re-run the full e2e for
+it, and it is the one number here that is calculated rather than observed.
+
 ## Where the gain comes from — kernel level
 
 Against FlashInfer, which is what your config selects
@@ -136,10 +145,15 @@ Prefill is 1.16 – 1.85x at the kernel (gmean 1.38x native fp8, 1.57x bf16).
    with no dequantised workspace, halving the KV bytes crossing L2.
 3. **Split-K decode** with a host-side split policy. At B=1 the unsplit kernel
    leaves one SM of 84 busy; splitting is **4.60x** there.
-4. **Merge warp count** — the split-K merge reduces a `[SPLIT_PAD, 512]` bf16
-   tile; at 128 threads each takes 8 bytes where the hardware wants a 16-byte
-   vector. 64 threads is 1.22x at B=8 and pulled B=8/16 up from 1.83x/1.45x to
-   2.16x/2.22x.
+4. **Merge warp count, chosen from `SPLIT_PAD`** — the split-K merge reduces a
+   `[SPLIT_PAD, 512]` bf16 tile along axis 0, across threads. Going 4 → 2 warps
+   was 1.22x at B=8 and pulled B=8/16 up from 1.83x/1.45x to 2.16x/2.22x. Going
+   further to 1 warp is a further **1.050x on the whole decode call** (PRO 6000;
+   1.028x on a 5080) — but only where the tile is tall: 1.29x at SPLIT_PAD 16,
+   1.02x at 8, and a *loss* at 4 and 2, where there is nothing to reduce and the
+   threads are wanted for the 512-wide store. So the count is a function of
+   SPLIT_PAD, not a constant, and it is never worse than the previous rule at
+   any shape measured on either part.
 
 ## Caveats, stated up front
 
@@ -214,11 +228,15 @@ above that argued from memory-traffic counts both measured slower.
 
 ## Validation
 
-- 33 tests in `test/registered/kernels/ops/attention/test_dsa_triton_sparse_mla_prefill.py`,
-  green on **two** sm_120 parts: RTX PRO 6000 (job 3657915, run twice — at merge
-  `num_warps` 4 and 2, to separate the merge change from the part) and RTX 5090
-  (job 3659011). One skip, which is the FlashInfer cross-check where FlashInfer
-  is not importable in the container.
+- 35 tests in `test/registered/kernels/ops/attention/test_dsa_triton_sparse_mla_prefill.py`,
+  green on **two** sm_120 parts — RTX PRO 6000 and RTX 5080 (jobs 3659941 /
+  3659942) — under the default merge policy *and* under merge `num_warps` forced
+  to 1, 2 and 4, so the warp count is separated from the part. Also green on an
+  RTX 5090 (3659011). One skip, the FlashInfer cross-check, where FlashInfer is
+  not importable in the container.
+- The merge's warp count does not move the answer: w=1 is **bitwise equal** to
+  w=2 at every (B, splits) measured on both parts, despite being a shorter
+  cross-thread reduction.
 - Accuracy against an fp32 oracle over the **dequantised stored** KV — the values
   the cache actually holds, so quantisation the kernel never chose is not charged
   to it: cos 0.999599, rel-L2 2.83e-2, unchanged by head tiling to six figures.
