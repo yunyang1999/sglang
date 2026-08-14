@@ -68,45 +68,50 @@ Fork at `deepseek-base-optimization` (`2538def09`), config verbatim:
 --dsa-paged-mqa-logits-backend deepgemm --enable-deepseek-v4-fp4-indexer
 ```
 
-Both arms on one 8x RTX PRO 6000 node, disjoint 4-GPU groups, simultaneous, 3
-reps. Arm A = your config as-is. Arm B = identical plus the two switches above.
+Both arms on one 8x RTX PRO 6000 node, disjoint 4-GPU groups, 3 reps. Arm A =
+your config as-is. Arm B = identical plus the two switches above.
+
+Run **twice with the arms swapped between the two 4-GPU groups** (jobs 3661108,
+3661109), and both placements are reported, because the swap turned out to
+matter more than we expected — see the note under the table.
 
 **LEVEL 1 — end to end** (your protocol: OSL 1024, 64 prompts, rate inf, seed 3)
 
-| ISL | CC | output tput B/A | TTFT B/A | **TPOT B/A** |
-|---|---|---|---|---|
-| 1024 | 8 | 1.028 | 1.036 | **0.967** |
-| 1024 | 32 | 1.036 | 1.032 | **0.961** |
-| 1024 | 64 | 1.036 | 1.036 | **0.959** |
-| 8192 | 8 | 1.022 | 1.032 | **0.967** |
-| 8192 | 32 | 1.013 | 1.014 | **0.971** |
-| 8192 | 64 | 1.000 | 1.029 | **0.987** |
+| ISL | CC | tput B/A | TTFT B/A | TPOT R1 | TPOT R2 | **TPOT mean** |
+|---|---|---|---|---|---|---|
+| 1024 | 8 | 1.031 | 1.002 | 0.966 | 0.975 | **0.970** |
+| 1024 | 32 | 1.034 | 1.024 | 0.959 | 0.968 | **0.964** |
+| 1024 | 64 | 1.039 | 1.015 | 0.953 | 0.962 | **0.958** |
+| 8192 | 8 | 1.026 | 1.016 | 0.962 | 0.975 | **0.968** |
+| 8192 | 32 | 1.013 | 1.019 | 0.964 | 0.982 | **0.973** |
+| 8192 | 64 | 1.001 | 1.024 | 0.972 | 0.998 | **0.985** |
 
-**LEVEL 3 — decode alone**: output tput 1.032 / 1.032, TPOT 0.968 / 0.968 at
-CC 8 / 64.
+**TPOT 0.958–0.985 — 1.5 to 4.2% better, at every one of the six points.**
 
-**LEVEL 2 — prefill alone**: TTFT B/A 1.008 (ISL 1024), 1.012 (ISL 8192).
-**Prefill gains nothing at the request level** — see the caveat below.
+**How much to trust a difference this size.** The placement swap alone moves
+TPOT by **+1.4 pp on average** (R2 − R1, range +0.9 to +2.6). That is the
+resolution of this experiment, and it is worth stating because it is *larger
+than some changes we were tempted to claim*: an earlier kernel revision
+measured at one placement looked +0.6 pp better, and running the other
+placement showed the real effect was +0.1 pp [−0.2, +0.3] — i.e. nothing. Read
+the mean column, not a single row, and treat anything under ~1.5 pp here as
+unresolved.
 
-**Accuracy**: GSM8K 400q 5-shot, A 0.958 / 0.958 against B 0.960 / 0.955.
-Indistinguishable.
+**LEVEL 3 — decode alone**: tput B/A 1.034 / 1.034 (R1) and 1.047 / 1.049 (R2);
+TPOT 0.966 / 0.966 and 0.949 / 0.950, at CC 8 / 64.
 
-Reproduced across two independent runs (jobs 3627369 and 3638276); TPOT B/A
-0.960-0.969 and 0.959-0.987.
+**LEVEL 2 — prefill alone** (CC 1, so no queueing): TTFT B/A 0.983 / 0.998 (R1)
+and 0.997 / 1.010 (R2), for ISL 1024 / 8192. Straddles 1.0 in both placements:
+**prefill is neutral at the request level, neither better nor worse.** Why, with
+the measurement, is under "Caveats".
+
+**Accuracy**: GSM8K 400q 5-shot, 2 reps x 2 placements. A: 0.963, 0.963, 0.953,
+0.965. B: 0.960, 0.963, 0.958, 0.968. Indistinguishable — B's spread sits inside
+A's.
 
 Routing is confirmed by path counters rather than by the flags: arm A takes
-FlashInfer 817 times and this kernel zero, arm B takes this kernel and
-FlashInfer **zero**.
-
-**These numbers understate the kernel you are being given.** The e2e ran before
-two later merge changes: 4 → 2 warps (1.055x on the decode call) and then the
-SPLIT_PAD-indexed count (a further 1.050x), together ~1.11x on the attention
-call. Folding that through the attention share derived below (2.4-7.5% of a
-decode step) puts another **0.2-0.7% of TPOT** on top of the table above, most
-of it at the short-context points where attention weighs most. That is an
-estimate from two measured quantities, not a measurement; we did not re-run the
-full e2e for it, and it is the one number here that is calculated rather than
-observed.
+FlashInfer and this kernel zero times, arm B takes this kernel and FlashInfer
+**zero**.
 
 ## Where the gain comes from — kernel level
 
@@ -156,12 +161,42 @@ Prefill is 1.16 – 1.85x at the kernel (gmean 1.38x native fp8, 1.57x bf16).
    SPLIT_PAD, not a constant, and it is never worse than the previous rule at
    any shape measured on either part.
 
+   Do not go looking for that 1.050x in the TPOT table: we re-ran the full e2e
+   for it across both placements and it came out at **+0.1 pp [−0.2, +0.3]** —
+   unresolvable, because attention is a single-digit share of a decode step and
+   the placement swap alone is worth +1.4 pp. It is a real kernel-level gain and
+   it is free, which is why it ships; it is not an end-to-end claim.
+
 ## Caveats, stated up front
 
-**Prefill is neutral end to end.** The kernel is 1.16–1.27x at 64 heads but TTFT
-does not move (1.008–1.012). Prefill is not attention-bound in this config. If
-you only want what pays, set `SGLANG_DSV4_TRITON_DECODE=1` and leave the prefill
-switch off.
+**Prefill is neutral end to end, and we measured why.** The kernel speedup is
+fully realised inside your server — CUDA-event timing around the dispatch, both
+arms, real requests:
+
+| | per prefill attention call |
+|---|---|
+| arm A | 484.5 us FlashInfer kernel + 105.1 us page transcode (256→64) = **589.6 us** |
+| arm B | **376.7 us** |
+| | **1.565x**, against 1.57x on the bench — nothing is lost in integration |
+
+It does not show up in TTFT because of what it is a fraction of:
+
+| ISL | TTFT | attention side, per request | **share of TTFT** |
+|---|---|---|---|
+| 1024 | 304 ms | 6.3 ms | **2.1%** |
+| 8192 | 1306 ms | 72.1 ms | **5.5%** |
+
+1.57x on 2.1–5.5% is 0.26–1.4% of TTFT at best, which is under the run-to-run
+spread — and that is exactly what the measurement shows. **If you only want what
+pays, set `SGLANG_DSV4_TRITON_DECODE=1` and leave the prefill switch off.**
+
+Two things this rules out, both of which we suspected first and had to drop:
+the extra bf16 workspace arm B materialises is **not** the reason (measured 4.7%
+of the workspace+attention pair at your chunk size of 4096, and that estimate
+over-counts the gather); and TTFT is **not** regressing — the LEVEL 1 TTFT
+column reads above 1.0 in places, but at ISL 8192 / CC 64 that TTFT is 21 s for
+a prefill that computes in well under a second, so LEVEL 1 TTFT is dominated by
+queueing under `rate inf` and is not a prefill measurement at all. LEVEL 2 is.
 
 **The decode ceiling is 2.4–7.5%, and we are at most of it.** Derived from your
 own A/B rather than estimated: both arms differ only in the attention kernel, so
@@ -205,6 +240,44 @@ Attributed rather than assumed: both values are byte-identical with the merge at
 `test_matches_bf16_gather` runs at `splits=1` where the merge is never called.
 Raised to 0.08 / 0.02 — widest part measured plus ~10%, so a real drift still
 trips them — with the measured numbers recorded in the test.
+
+## How much of the machine is it using
+
+"2.2x over FlashInfer" says we beat the incumbent, not that the part is used up.
+Denominators measured on the same GPU rather than taken from a spec sheet — a
+large square GEMM per dtype, and a 256 MB copy — because marketing peaks
+generally include 2:4 sparsity this kernel cannot use.
+
+RTX PRO 6000 Blackwell measures **749.9 TFLOP/s fp8**, **392.5 TFLOP/s bf16**,
+**1460 GB/s** copy.
+
+| | achieved | % of measured GEMM peak | % of copy bandwidth |
+|---|---|---|---|
+| decode B=1 | 6.8 TFLOP/s | 0.90% | 2.0% |
+| decode B=16 | 57.2 TFLOP/s | 7.63% | 17.2% |
+| decode B=128 | 80.7 TFLOP/s | 10.76% | 24.3% |
+| prefill T=4096 | 109.1 TFLOP/s | 27.81% (bf16) | — |
+
+**The low FLOP fractions are the right answer, not a defect.** Arithmetic
+intensity is **227.6 FLOP/byte** against this part's ridge point of **513.5**, so
+the shape is memory-bound — and the intensity is fixed by DSv4's `d=512,
+topk=640`. No kernel change moves it.
+
+**But at the batch sizes that matter, neither roofline binds.** B=1–16 sits at
+2–17% of bandwidth and 0.9–7.6% of compute: the kernel is waiting, which is what
+NCU says too (`No Eligible` 73.85%, L1/TEX 50.92% against DRAM 8.02%). The
+reason is parallelism, not efficiency — at B=1 the launch is 4 head tiles x 10
+splits = **40 blocks against 376 block slots, 11% of the device**. The KV a B=1
+step must move is 369 KB, which is 0.25 us of bandwidth against 12.4 us measured.
+That 49x is a floor, not a target: 369 KB of work cannot fill 188 SMs however
+the kernel is written.
+
+Two things follow, and they are worth stating plainly. Prefill, at 28% of bf16
+GEMM peak, is the part that is in good absolute shape — and it is the part worth
+nothing end to end. And the nine rejected experiments below are consistent with
+this picture rather than surprising: if the bottleneck is neither compute nor
+bandwidth but latency at low occupancy, then tile, occupancy and traffic-saving
+changes should not win, and none of them did.
 
 ## How general is this — what is tuned and what is not
 
