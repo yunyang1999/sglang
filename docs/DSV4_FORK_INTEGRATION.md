@@ -12,7 +12,7 @@ One framework-neutral file — module-level imports are `logging`, `torch`,
 
     python/sglang/kernels/ops/attention/dsa/triton_sparse_mla_prefill.py
 
-plus ~137 lines of wiring across three existing files. Both entry points are
+plus ~156 lines of wiring across three existing files. Both entry points are
 off by default and only reachable on SM120:
 
 ```bash
@@ -30,11 +30,11 @@ git apply dsv4-sm120-triton-sparse-mla.patch
 
 | file | lines | what |
 |---|---|---|
-| `.../dsa/triton_sparse_mla_prefill.py` | +4181 | the kernel (new file) |
+| `.../dsa/triton_sparse_mla_prefill.py` | +4201 | the kernel (new file) |
 | `srt/environ.py` | +21 | the switches |
-| `srt/layers/attention/deepseek_v4_backend.py` | +99/-9 | decode/prefill dispatch |
+| `srt/layers/attention/deepseek_v4_backend.py` | +118/-9 | decode/prefill dispatch + capability guard |
 | `srt/models/deepseek_v4.py` | +17 | skip head padding on the Triton prefill route |
-| `test/.../test_dsa_triton_sparse_mla_prefill.py` | +1004 | 35 tests |
+| `test/.../test_dsa_triton_sparse_mla_prefill.py` | +1039 | 36 tests |
 
 The patch is cut **against your `2538def09`, from the tree that produced the
 numbers below** — not rebased from ours, which had drifted from yours in
@@ -101,11 +101,12 @@ FlashInfer **zero**.
 **These numbers understate the kernel you are being given.** The e2e ran before
 two later merge changes: 4 → 2 warps (1.055x on the decode call) and then the
 SPLIT_PAD-indexed count (a further 1.050x), together ~1.11x on the attention
-call. Folding that through the attention share derived below (6.4-8.0% of a
-decode step) puts another **0.6-0.8% of TPOT** on top of the table above — so
-the true figure is nearer 0.953-0.980 than 0.959-0.987. That is an estimate from
-two measured quantities, not a measurement; we did not re-run the full e2e for
-it, and it is the one number here that is calculated rather than observed.
+call. Folding that through the attention share derived below (2.4-7.5% of a
+decode step) puts another **0.2-0.7% of TPOT** on top of the table above, most
+of it at the short-context points where attention weighs most. That is an
+estimate from two measured quantities, not a measurement; we did not re-run the
+full e2e for it, and it is the one number here that is calculated rather than
+observed.
 
 ## Where the gain comes from — kernel level
 
@@ -162,18 +163,30 @@ does not move (1.008–1.012). Prefill is not attention-bound in this config. If
 you only want what pays, set `SGLANG_DSV4_TRITON_DECODE=1` and leave the prefill
 switch off.
 
-**The decode ceiling is ~6–8%, and we are at about half of it.** Derived from
-your own A/B rather than estimated — both arms differ only in the attention
-kernel, so `t_attn = ΔTPOT / (1 - 1/s)`:
+**The decode ceiling is 2.4–7.5%, and we are at most of it.** Derived from your
+own A/B rather than estimated: both arms differ only in the attention kernel, so
+the whole TPOT delta is attention, and `attention share = (1 - TPOT_B/A) /
+(1 - 1/s)` where `s` is the kernel speedup at that config's per-rank batch.
 
-| | attention share of a decode step | ceiling on TPOT | needed for −5% |
-|---|---|---|---|
-| CC=8 (per-rank B≈2) | 6.4% | −6.4% | 4.6x over FlashInfer |
-| CC=64 (per-rank B≈16) | 8.0% | −8.0% | 2.7x over FlashInfer |
+| ISL | CC | per-rank B | TPOT B/A | s | attention share | ceiling on TPOT | needed for −5% |
+|---|---|---|---|---|---|---|---|
+| 1024 | 8 | 2 | 0.967 | 2.20 | 6.1% | −6.1% | 5.8x |
+| 1024 | 32 | 8 | 0.961 | 2.16 | 7.3% | −7.3% | 3.2x |
+| 1024 | 64 | 16 | 0.959 | 2.22 | 7.5% | −7.5% | 3.0x |
+| 8192 | 8 | 2 | 0.967 | 2.20 | 6.1% | −6.1% | 5.8x |
+| 8192 | 32 | 8 | 0.971 | 2.16 | 5.4% | −5.4% | 13.5x |
+| 8192 | 64 | 16 | 0.987 | 2.22 | **2.4%** | −2.4% | impossible |
 
-Attention is 6–8% of a decode step in a 43-layer MoE. An infinitely fast
-attention kernel buys −6.4% at CC=8. **−5% end to end is not reachable from this
-kernel**, and no amount of tile tuning changes that.
+Attention is a **single-digit percentage of a decode step** in a 43-layer MoE —
+the other 92–98% is MoE GEMMs, the indexer, dispatch/combine and the rest of the
+block. An *infinitely fast* attention kernel buys −7.5% at the best of these
+points and −2.4% at the worst. **−5% end to end is not reachable from an
+attention kernel here**, and no amount of tile tuning changes that.
+
+This also explains the shape of the e2e table: the config where attention
+matters least (ISL 8192, CC 64, share 2.4%) is exactly the one where TPOT barely
+moved (0.987), and the configs where it matters most are where we gained most.
+The kernel's 2.2x is being applied to a small slice, and 2.2x on 7% is 3.8%.
 
 **The advantage narrows with batch and with head count** — 2.20x at B=1 down to
 1.29x at B=128. The mechanism is head tiling's own cost: each token's KV is
@@ -192,6 +205,55 @@ Attributed rather than assumed: both values are byte-identical with the merge at
 `test_matches_bf16_gather` runs at `splits=1` where the merge is never called.
 Raised to 0.08 / 0.02 — widest part measured plus ~10%, so a real drift still
 trips them — with the measured numbers recorded in the test.
+
+## How general is this — what is tuned and what is not
+
+Worth being explicit, because the answer differs by layer.
+
+**Structural, no table, follows any device or shape.** The native fp8 gather
+(no dequantised workspace); split-K, whose split count `auto_splits` derives from
+the runtime SM count; and the merge warp count, which is keyed on `SPLIT_PAD` —
+a property of the *shape*, not of the part — so it re-derives itself on hardware
+we have never run. Split-K alone is 4.60x at B=1.
+
+**Pinned to (arch, head count).** Head tiling — the single largest win, 1.72–2.13x
+on decode — fires only on entries in `_PINNED_NATIVE_HEAD_TILE`, currently
+`{(12,0): {32:16, 64:16}}`. Anything else falls back to the untiled kernel:
+correct, and about half the speed. Head-count coverage is less narrow than it
+looks, since at H≤16 the tile would equal H and tiling is a no-op by
+construction, so {32, 64} is the complete set where it can help. The **arch** key
+is the real limit: one entry.
+
+**Two cliffs found while writing this, both now fixed.**
+
+* *sm_121 crashed instead of falling back.* `is_sm120_supported()` is true for
+  the whole 12.x major, but only sm_120 has the e4m3 mma; the kernel refuses
+  sm_121 (it upcasts, which would make this path slower than the one it
+  replaces) by raising, and nothing caught it — so on an sm_121 part the decode
+  switch took down the server on its first decode step. The backend now asks
+  `_has_fp8_mma()` once at import and logs a warning and stays on FlashInfer.
+  Your cluster has an `rtx-pro-6000-blackwell-workstation-edition` partition, so
+  this was reachable, not hypothetical.
+* *The untiled fallback was unbounded in H.* Falling back to "one program holds
+  every head" is the right default across devices — it reproduces the kernel the
+  table was measured against — and the wrong one across head counts, because the
+  fp32 accumulator is `[BLOCK_H, d_v]` and so costs registers linearly in H. At
+  H=128 that is 256 KB for the block, which nothing had ever run. Bounded at
+  `_MONO_CAP = 64`, the widest tile known to compile and run (it was the shipping
+  configuration before head tiling). Every head count ever measured here has
+  mono ≤ 64, so this changes nothing that has been run and only bounds the
+  regime that had no answer.
+
+**Measured coverage**, so the generality claim is not just structural:
+
+| axis | range | speedup |
+|---|---|---|
+| head count | 8 / 16 / 32 / 64 | 1.17 – 2.50x |
+| candidate width | 128 + {256, 512, 1024} | 1.17 – 2.20x |
+| pool size (L2 pressure) | 8k → 64k | 1.29 – 2.20x |
+| ragged candidate lists | per-row lengths | 1.29 – 2.00x |
+| batch | 1 → 128 | 2.20 → 1.29x |
+| device | 5080 / 5090 / PRO 6000 | gmean 2.04 / 2.15 / 2.21x |
 
 ## Things we tried and rejected
 
@@ -228,9 +290,9 @@ above that argued from memory-traffic counts both measured slower.
 
 ## Validation
 
-- 35 tests in `test/registered/kernels/ops/attention/test_dsa_triton_sparse_mla_prefill.py`,
-  green on **two** sm_120 parts — RTX PRO 6000 and RTX 5080 (jobs 3659941 /
-  3659942) — under the default merge policy *and* under merge `num_warps` forced
+- 36 tests in `test/registered/kernels/ops/attention/test_dsa_triton_sparse_mla_prefill.py`,
+  green on **two** sm_120 parts — RTX PRO 6000 and RTX 5080 (jobs 3660704 /
+  3660705) — under the default merge policy *and* under merge `num_warps` forced
   to 1, 2 and 4, so the warp count is separated from the part. Also green on an
   RTX 5090 (3659011). One skip, the FlashInfer cross-check, where FlashInfer is
   not importable in the container.
