@@ -113,6 +113,58 @@ Routing is confirmed by path counters rather than by the flags: arm A takes
 FlashInfer and this kernel zero times, arm B takes this kernel and FlashInfer
 **zero**.
 
+## How the kernel is built
+
+What it has to do to be *correct* for DSv4, before any question of speed. This
+is the part to read if you are reviewing or maintaining it.
+
+**One fused pass over two KV pools with different page sizes.** DSv4-Flash
+selects `index_topk=512` from the compressed cache and `sliding_window=128` from
+the SWA cache — 640 candidates per query, living in two pools paged at 64 and
+256 respectively. The kernel takes both (`extra_cache`/`extra_page_size`) and
+walks them in a single softmax, rather than running twice and merging: one
+online-softmax running max, one accumulator, one pass. Per-row candidate counts
+are passed in (`topk_length`, `extra_topk_length`) so short rows cost nothing.
+
+**It reads the stored fp8 bytes directly — no dequantised workspace.** A row is
+`448` fp8 bytes then `64` bf16 rope values (576 B), and the per-token ue8m0
+exponents live in a footer at the end of each page: the interior is
+`[P x row_bytes data][P x scale_bytes footer]`, with 7 scale bytes padded to 8.
+Indices are absolute token ids — there is no page table indirection. The fp8
+tile goes into the tensor core as an mma operand in either orientation
+(QMMA.16832) and is never materialised as bf16; the scale is applied as one byte
+per row, not broadcast into a `[BLOCK_N, 512]` tile.
+
+**Non-contiguous pools are supported, and SGLang needs that.** The backend hands
+over `swa_k_cache[:, : swa_window_size * k_cache_total_dim]` reshaped to 4-D — a
+slice along dim 1, so consecutive pages sit `stride(0)` bytes apart inside a
+*wider* parent buffer. The kernel takes the stride rather than assuming
+contiguity. Getting this wrong is not a wrong answer, it is a crash or a silent
+whole-pool copy; see the trap note under Validation.
+
+**The learned per-head sink joins the softmax denominator, exactly once.**
+`attn_sink` is a raw natural-log logit with no value row, folded in the way
+`_apply_attn_sink` does it — `logaddexp(lse, sink)`. Under split-K it is
+deliberately *not* visible to the split kernel: each split would otherwise add
+it again. It enters at the merge, and it enters the global max first, so
+`exp(sink - gm)` cannot overflow when every real logit sits far below it.
+
+**Split-K is exact, in the log domain.** Splits produce partial `(out, m, l)`;
+the merge takes the global max across splits, rescales each by `exp(m_i - gm)`,
+sums, and divides once. Algebraically identical to the unsplit kernel, not
+bitwise — the softmax is reassociated and partials round to `partial_dtype`.
+`splits=1` reproduces the unsplit kernel bit for bit, which is what
+`SGLANG_DSV4_TRITON_DECODE_SPLITS=1` gives you if you ever need to bisect.
+
+**Head tiling is bitwise-invariant within a layout family.** Splitting the grid
+by head block changes which program computes a row, not the arithmetic — so
+tiles 8/16/32 are bit-identical to each other. The exception is documented
+rather than hidden: at BLOCK_H=64 Triton's `warpsPerCTA` flips `[1,4]` → `[4,1]`
+and the softmax row reduction becomes intra-warp instead of a cross-warp tree,
+so results differ in the last bits (cos 1.0000000, max|d| 0.0010, under one bf16
+ULP). Comparisons are only meaningful within a family, and the tests pin
+`BLOCK_N` when they compare tiles for exactly this reason.
+
 ## Where the gain comes from — kernel level
 
 Against FlashInfer, which is what your config selects
