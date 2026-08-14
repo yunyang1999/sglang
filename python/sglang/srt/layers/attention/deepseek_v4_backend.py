@@ -102,6 +102,25 @@ _DSV4_TRITON_DECODE_SPLITS = envs.SGLANG_DSV4_TRITON_DECODE_SPLITS.get()
 
 logger = logging.getLogger(__name__)
 
+if _dsv4_triton_decode and _is_sm120:
+    # `is_sm120_supported()` is true for the whole 12.x major, but the decode
+    # kernel reads the stored fp8 straight into the tensor core and only sm_120
+    # has that instruction -- sm_121 upcasts, which makes this path slower than
+    # the one it would replace, so the kernel refuses it outright. Ask here,
+    # once, rather than letting that refusal surface as an exception out of the
+    # first decode step: the switch being on is a request, not an assertion that
+    # the hardware can serve it.
+    from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+        _has_fp8_mma,
+    )
+
+    if not _has_fp8_mma():
+        logger.warning(
+            "SGLANG_DSV4_TRITON_DECODE is set but this device has no native "
+            "e4m3 mma; falling back to the FlashInfer decode path."
+        )
+        _dsv4_triton_decode = False
+
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64

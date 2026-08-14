@@ -644,6 +644,41 @@ class TestSplitKDecode(CustomTestCase):
                     max_abs=0.01,
                 )
 
+    def test_untiled_fallback_is_bounded(self):
+        # An (arch, head count) with no measured entry falls back to the untiled
+        # tile. That is the right default across *devices* -- it reproduces the
+        # kernel the table was measured against -- and the wrong one across
+        # *head counts*, because the untiled tile's fp32 accumulator is
+        # [BLOCK_H, d_v] and so costs registers linearly in H. At H=128 that is
+        # 256 KB for the block and nothing has ever run it.
+        #
+        # So: unchanged wherever the kernel has actually been measured (H <= 64,
+        # where mono <= 64 and the cap cannot bind), bounded above it.
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            _MONO_CAP,
+            _head_tile,
+            _native_head_tile,
+        )
+
+        # every h below is already a power of two, so mono == h and there is no
+        # need to pull triton in just to round it.
+        dev = torch.device("cuda")
+        for resolve in (_head_tile, _native_head_tile):
+            for h in (8, 16, 32, 64):
+                with self.subTest(fn=resolve.__name__, h=h):
+                    # never above the untiled tile, and never above the cap
+                    self.assertLessEqual(resolve(dev, h, h), h)
+                    self.assertLessEqual(resolve(dev, h, h), _MONO_CAP)
+            for h in (128, 256):
+                with self.subTest(fn=resolve.__name__, h=h):
+                    tile = resolve(dev, h, h)
+                    self.assertLessEqual(
+                        tile, _MONO_CAP,
+                        f"{resolve.__name__} left H={h} monolithic; the "
+                        f"accumulator is linear in the tile height",
+                    )
+                    self.assertGreaterEqual(tile, 1)
+
     def test_merge_warps_follows_split_pad(self):
         # The merge's warp count comes from the height of the tile it reduces,
         # not from the batch. This guards the shape of that rule rather than its

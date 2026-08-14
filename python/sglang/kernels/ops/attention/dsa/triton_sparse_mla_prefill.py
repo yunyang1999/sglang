@@ -1579,6 +1579,21 @@ _NARROW_H = 8  # head counts at or below this take the narrow-H entry
 # listed here stays monolithic, so no untuned device or head count silently
 # changes shape. Entries are added only from a measured sweep.
 #
+# "Monolithic" is a safe fallback across *devices* and a dangerous one across
+# *head counts*, and `_MONO_CAP` is where those two part company. The untiled
+# tile carries a `[BLOCK_H, d_v]` fp32 accumulator, so its register cost is
+# linear in H: at H=64 that is 9,104 B of spill -- slow, which is why the table
+# exists, but it compiles and runs, and it was the shipping configuration before
+# head tiling. At H=128 it is twice that again, and nothing in this file has ever
+# run it. An unlisted (arch, H) is meant to reproduce the untiled kernel, not to
+# walk off a cliff the moment H grows, so the fallback is capped at the widest
+# tile that is known to work rather than at H itself.
+#
+# Every head count this kernel has been measured at (8, 16, 32, 64) has
+# mono <= 64, so the cap changes nothing that has ever been run -- it only
+# bounds the regime that had no answer at all.
+_MONO_CAP = 64
+#
 # Why this is a grid change and not a tile change: the whole 96-config
 # (BLOCK_H, BLOCK_N, warps, stages) sweep recorded in this file holds
 # BLOCK_H == H and varies the tile. Re-sweeping (BLOCK_N, warps, stages) at
@@ -1621,13 +1636,15 @@ def _head_tile(device, num_heads, mono, override=None):
     table"; any other value is taken literally, which is what the sweep uses.
 
     The returned value is always a power of two and never exceeds ``mono``, so
-    the default reproduces the untiled kernel exactly.
+    the default reproduces the untiled kernel exactly -- up to ``_MONO_CAP``,
+    past which an unlisted head count is tiled rather than left monolithic.
     """
     if override:
         tile = min(int(override), mono)
     else:
         cap = torch.cuda.get_device_capability(device)
-        tile = _PINNED_HEAD_TILE.get(cap, {}).get(num_heads, mono)
+        tile = _PINNED_HEAD_TILE.get(cap, {}).get(num_heads,
+                                                  min(mono, _MONO_CAP))
     tile = max(1, min(triton.next_power_of_2(tile), mono))
     return tile
 
@@ -3852,13 +3869,16 @@ def _native_head_tile(device, num_heads, mono, override=None):
     Same contract as `_head_tile`: returns ``mono`` -- one program per token
     holding every head -- unless this (arch, head count) has a measured entry,
     and never exceeds ``mono``, so an unswept device reproduces the untiled
-    kernel exactly.
+    kernel exactly. Bounded by ``_MONO_CAP`` for the same reason it is there:
+    monolithic is a safe fallback across devices and an unbounded register cost
+    across head counts.
     """
     if override:
         tile = min(int(override), mono)
     else:
         cap = torch.cuda.get_device_capability(device)
-        tile = _PINNED_NATIVE_HEAD_TILE.get(cap, {}).get(num_heads, mono)
+        tile = _PINNED_NATIVE_HEAD_TILE.get(cap, {}).get(
+            num_heads, min(mono, _MONO_CAP))
     return max(1, min(triton.next_power_of_2(tile), mono))
 
 
