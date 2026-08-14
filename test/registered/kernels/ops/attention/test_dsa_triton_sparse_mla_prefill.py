@@ -619,7 +619,11 @@ class TestSplitKDecode(CustomTestCase):
                     )
                     _assert_matches(
                         self, got, ref, f"split B={B} S={splits}",
-                        cos_min=0.99999, max_abs=0.01,
+                        # Same story as `test_matches_bf16_gather`: 0.01 held on
+                        # a 5080/5090 and an RTX PRO 6000 measures 0.015625 at
+                        # (B=1, S=4), byte-identical whether the merge runs at 4
+                        # warps or 2. cos stays at 0.9999969.
+                        cos_min=0.99999, max_abs=0.02,
                     )
 
     def test_split_auto_is_correct(self):
@@ -696,7 +700,16 @@ class TestNativePagedFP8(CustomTestCase):
                     sparse_mla_prefill(q, kv, idx, SM_SCALE, 512, attn_sink=sink),
                     f"native paged fp8 h={h}",
                     cos_min=0.999,
-                    max_abs=0.06,
+                    # 0.06 was set on an RTX 5080/5090. The same call on an RTX
+                    # PRO 6000 Blackwell measures 0.0732 at h=8 and 0.0586 at
+                    # h=16 -- identical with the merge at 4 warps and at 2, and
+                    # with `splits=1` so the merge is not even called, i.e. it
+                    # is the part, not any change here. `cos` is unmoved at
+                    # 0.999465, which is what says the answer is right and only
+                    # the last bits differ. Raised to cover the widest sm_120
+                    # part measured, with 10% of headroom and no more, so a real
+                    # drift still trips it.
+                    max_abs=0.08,
                 )
 
     def test_split_matches_unsplit(self):
