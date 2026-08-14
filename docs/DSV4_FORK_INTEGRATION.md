@@ -128,6 +128,11 @@ replay:
 from `#running-req` in the server log: 2:5683, 8:1387, 1:1223, 16:1176, 4:402.
 B=2 alone is 54%.
 
+These ratios pre-date the SPLIT_PAD merge rule, which is worth a further 1.050x
+on the decode call, so they understate the shipped kernel by about that much.
+Left as measured rather than scaled: a number we ran is worth more than a number
+we multiplied, and erring low is the right direction for a figure you may quote.
+
 Holds across the other axes, so it is not one shape getting lucky:
 
 | axis | range | speedup |
