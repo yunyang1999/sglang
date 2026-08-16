@@ -12,21 +12,66 @@ One framework-neutral file — module-level imports are `logging`, `torch`,
 
     python/sglang/kernels/ops/attention/dsa/triton_sparse_mla_prefill.py
 
-plus ~156 lines of wiring across three existing files. Both entry points are
-off by default and only reachable on SM120:
+plus ~156 lines of wiring across three existing files.
 
-```bash
-export SGLANG_DSV4_TRITON_DECODE=1          # this is the one that pays
-export SGLANG_DSV4_TRITON_SPARSE_PREFILL=1  # optional; measured 0 end to end
-```
-
-Leave `SGLANG_DSV4_TRITON_DECODE_SPLITS=0` (means "choose host-side") and
-`SGLANG_DSV4_TRITON_UNION=0`.
+## How to use it
 
 ```bash
 git checkout 2538def09          # or your current deepseek-base-optimization
 git apply dsv4-sm120-triton-sparse-mla.patch
 ```
+
+Then launch your Best Config **unchanged**, with one variable added:
+
+```bash
+export SGLANG_DSV4_TRITON_DECODE=1     # the only one you need
+```
+
+That is the whole integration. Everything else is default-off.
+
+### The four switches
+
+| variable | default | what it does |
+|---|---|---|
+| `SGLANG_DSV4_TRITON_DECODE` | `0` | **Recommended on.** Routes DSv4 decode through this kernel. This is where all the measured gain is. |
+| `SGLANG_DSV4_TRITON_SPARSE_PREFILL` | `0` | **Recommended off.** Routes sparse prefill here too. The kernel is 1.18–1.37x at your head count and that is fully realised in the server — but it is worth **0% of TTFT**, measured. See Caveats. |
+| `SGLANG_DSV4_TRITON_DECODE_SPLITS` | `0` | `0` = choose the split count host-side from batch, heads and candidate count. Leave it. `1` forces the unsplit kernel, which is bit-for-bit identical to no-split — a bisection handle, not a tuning knob. |
+| `SGLANG_DSV4_TRITON_UNION` | `0` | Leave at 0. Only pays above ~0.75 neighbour retention, which DSv4 does not reach. |
+
+### When it actually engages
+
+Both switches are **SM120-only** and are ignored elsewhere, so the same launch
+line is safe on a mixed fleet. The decode switch additionally checks for native
+e4m3 mma at import: on a part that lacks it (sm_121 upcasts fp8, which would make
+this path *slower* than what it replaces) it logs a warning and stays on
+FlashInfer rather than failing. Nothing here can take a server down for being on
+the wrong hardware.
+
+No shape constraints to respect: any head count, any candidate width, ragged
+per-row lengths, contiguous or sliced KV pools. If a shape has never been swept
+it falls back to a bounded untiled tile — correct, just not tuned.
+
+### Calling it directly
+
+Framework-neutral, if you want it outside the DSv4 path:
+
+```python
+from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+    sparse_mla_prefill_paged_fp8_native,   # reads paged fp8 in place
+    sparse_mla_prefill,                    # reads a dequantised bf16 workspace
+)
+
+out = sparse_mla_prefill_paged_fp8_native(
+    q, swa_k_cache, swa_indices, sm_scale, swa_page_size,
+    extra_cache=c4_cache, extra_indices=c4_indices, extra_page_size=64,
+    topk_length=swa_lens, extra_topk_length=c4_lens,   # per-row, ragged ok
+    attn_sink=sink,                                    # per-head, folded once
+    splits="auto",                                     # or 1 for bitwise-unsplit
+)
+```
+
+Module-level imports are `logging`, `torch`, `triton`, `triton.language` and
+nothing else, so the file drops into any tree.
 
 | file | lines | what |
 |---|---|---|
@@ -185,17 +230,66 @@ on the decode call, so they understate the shipped kernel by about that much.
 Left as measured rather than scaled: a number we ran is worth more than a number
 we multiplied, and erring low is the right direction for a figure you may quote.
 
-Holds across the other axes, so it is not one shape getting lucky:
+### The baseline, and why beating it means something
 
-| axis | range | speedup |
+FlashInfer's CUTLASS SM120 sparse-MLA is not a strawman — it is the path your
+config already selects, it is hand-written CUTLASS, and it reads the same stored
+fp8 bytes and ue8m0 exponents we do. Two things are done to keep the comparison
+honest rather than flattering:
+
+* **FlashInfer is called at its own smallest legal head count** (`FInat` below),
+  not padded to 64. Its decode specialises h_q for {64, 128} and its SM120
+  prefill accepts {16, 32, 64, 128}, so padding a 16-head rank up to 64 costs it
+  4x the work — real for the framework, but not the kernel's fault, so it is not
+  charged to it. Where 64 *is* its own count the padded and native numbers
+  coincide.
+* **Decode is timed under CUDA-graph replay.** Its Python wrapper carries ~106 us
+  of host overhead; timing eagerly hands you a ~6x "speedup" that does not exist.
+
+### Decode, full grid — RTX 5090 (170 SM), CUDA-graph replay, ms
+
+Speedup column is FlashInfer-at-its-own-head-count over this kernel.
+
+| batch | H=8 | H=64 | | pool 8k | pool 64k |
+|---|---|---|---|---|---|
+| B=1 | **2.37x** | **2.00x** | | 2.00x | **2.20x** |
+| B=2 | **2.49x** | 2.00x | | | |
+| B=4 | **2.49x** | 2.20x | | | |
+| B=8 | 2.29x | 1.72x | | | |
+| B=16 | 2.00x | 2.11x | | | |
+| B=32 | 2.00x | 1.65x | | 1.65x | **2.18x** |
+| B=64 | **2.50x** | 1.76x | | | |
+| B=128 | 4.61x* | 1.16x | | 1.16x | 1.40x |
+
+\* at B=128 H=8 FlashInfer has no legal smaller head count, so this is against
+its padded call — the one place the framework's padding *is* included.
+
+**gmean over the whole B x H grid: 2.15x.** Bigger pools help us (2.18x at 64k
+vs 1.65x at 8k, B=32): more L2 pressure hurts the baseline more than it hurts a
+kernel that reads fp8 in place.
+
+| axis | range tested | speedup |
 |---|---|---|
-| candidate width | 128 + {256, 512, 1024} | 1.17 – 2.20x |
-| pool size (L2 pressure) | 8k → 64k | 1.29 – 2.20x |
-| ragged candidate lists | per-row lengths | 1.29 – 2.00x |
-| head count | 8 / 16 / 32 / 64 | 1.17 – 2.50x |
+| candidate width | 128 + {256, 512} | 1.17 – 2.50x |
+| pool size (L2 pressure) | 8k → 64k | 1.16 – 2.20x |
+| ragged rows (mixed real lengths) | B = 8 / 32 / 128 | 1.18 – 2.00x |
+| head count | 8 / 16 / 32 / 64 | 1.16 – 2.50x |
 | device | 5080 (84 SM) / 5090 (170) / PRO 6000 (188) | gmean 2.04 / 2.15 / 2.21x |
 
-Prefill is 1.16 – 1.85x at the kernel (gmean 1.38x native fp8, 1.57x bf16).
+### Prefill, full grid — RTX 5090, eager, ms
+
+| tokens | H=8 | H=16 | H=32 | H=64 |
+|---|---|---|---|---|
+| T=512 | 1.78x | 1.67x | 1.34x | 1.20x |
+| T=1024 | 1.74x | 1.59x | 1.30x | 1.37x |
+| T=2048 | 1.82x | 1.63x | 1.43x | 1.28x |
+| T=4096 | **2.05x** | 1.77x | 1.36x | 1.20x |
+| T=8192 | 1.98x | 1.78x | 1.33x | 1.18x |
+
+Flat in token count — the advantage is a property of the head count, not the
+chunk size, and it narrows as heads widen for the same reason decode does (head
+tiling re-gathers each token's KV once per head tile). At your padded h=64 that
+is **1.18–1.37x**, and it is worth nothing end to end; see Caveats.
 
 ### The four things it does differently
 
