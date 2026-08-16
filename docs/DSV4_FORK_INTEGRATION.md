@@ -545,6 +545,7 @@ above that argued from memory-traffic counts both measured slower.
 
 ## Files here
 
-    README.md                              this
+    RESULTS.md                             every number on one page, start here
+    README.md                              this -- method, design, caveats
     dsv4-sm120-triton-sparse-mla.patch     apply to deepseek-base-optimization
     triton_sparse_mla_prefill.py           the kernel on its own
