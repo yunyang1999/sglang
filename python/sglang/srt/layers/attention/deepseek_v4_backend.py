@@ -82,7 +82,34 @@ _is_sm120 = is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
+# Consume the sparse-prefill workspace with the Triton sparse-MLA kernel rather
+# than flash_mla_sparse_fwd. Read once, like the other module-level capability
+# flags, so the hot path does not re-read the environment per layer.
+_dsv4_triton_sparse_prefill = envs.SGLANG_DSV4_TRITON_SPARSE_PREFILL.get()
+_dsv4_triton_union = envs.SGLANG_DSV4_TRITON_UNION.get()
+_dsv4_triton_decode = envs.SGLANG_DSV4_TRITON_DECODE.get()
+_DSV4_TRITON_DECODE_SPLITS = envs.SGLANG_DSV4_TRITON_DECODE_SPLITS.get()
+
 logger = logging.getLogger(__name__)
+
+if _dsv4_triton_decode and _is_sm120:
+    # `is_sm120_supported()` is true for the whole 12.x major, but the decode
+    # kernel reads the stored fp8 straight into the tensor core and only sm_120
+    # has that instruction -- sm_121 upcasts, which makes this path slower than
+    # the one it would replace, so the kernel refuses it outright. Ask here,
+    # once, rather than letting that refusal surface as an exception out of the
+    # first decode step: the switch being on is a request, not an assertion that
+    # the hardware can serve it.
+    from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+        _has_fp8_mma,
+    )
+
+    if not _has_fp8_mma():
+        logger.warning(
+            "SGLANG_DSV4_TRITON_DECODE is set but this device has no native "
+            "e4m3 mma; falling back to the FlashInfer decode path."
+        )
+        _dsv4_triton_decode = False
 
 SWA_WINDOW = 128
 C4_TOPK = 512
@@ -1688,13 +1715,21 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sparse_prefill_fwd does not support SM120.
+            # sparse_prefill_fwd does not support SM120 -- but the path itself
+            # does. Everything ahead of the kernel (the chunk cache, the flat
+            # bf16 workspace, the rebased indices) is architecture-neutral; only
+            # the final flash_mla_sparse_fwd call is gated. With the Triton
+            # sparse-MLA kernel selected, that call is replaced and SM120 can
+            # take the sparse-prefill route instead of falling through to
+            # flash_mla_with_kvcache_sm120, which transcodes the page pool
+            # 256 -> 64 before every FlashInfer call.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and (not _is_sm120 or _dsv4_triton_sparse_prefill)
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                    or _dsv4_triton_sparse_prefill
                 )
             ):
                 return self._forward_prefill_sparse(
@@ -1707,7 +1742,40 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if _is_sm120 and _dsv4_triton_decode:
+                # The Triton sparse-MLA kernel reads the two paged fp8 pools
+                # directly, so decode needs no dequantised workspace and no head
+                # padding. Split-K fills the device at small batch, where one
+                # program per query token would otherwise leave 1 SM of 84 busy.
+                from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+                    sparse_mla_prefill_paged_fp8_native,
+                )
+
+                q3 = q.squeeze(1) if q.ndim == 4 else q
+                sink = attn_sink
+                if sink is not None and sink.shape[0] != q3.shape[1]:
+                    sink = sink[: q3.shape[1]].contiguous()
+                o = sparse_mla_prefill_paged_fp8_native(
+                    q3,
+                    swa_k_cache,
+                    swa_page_indices,
+                    self.softmax_scale,
+                    swa_window_size,
+                    extra_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_page_size=(
+                        page_sizes[compress_ratio]
+                        if extra_k_cache is not None
+                        else None
+                    ),
+                    extra_topk_length=extra_topk_lengths,
+                    attn_sink=sink,
+                    topk_length=swa_topk_lengths,
+                    # 0 is the config's "choose for me"; the kernel's sentinel
+                    # for that is the string "auto".
+                    splits=_DSV4_TRITON_DECODE_SPLITS or "auto",
+                ).unsqueeze(1)
+            elif _is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     _SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,
@@ -1775,19 +1843,22 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
     ) -> torch.Tensor:
-        """Unified prefill via flash_mla_sparse_fwd. Replaces the
+        """Unified prefill via a sparse-MLA kernel. Replaces the
         flash_mla_with_kvcache call on the extend path. Per request,
         positionally gathers the SWA window (always) and the compressed
-        cache (c4/c128) into a flat bf16 workspace, then lets
-        flash_mla_sparse_fwd consume the workspace via per-query rebased
+        cache (c4/c128) into a flat bf16 workspace, then lets the kernel
+        consume the workspace via per-query rebased
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        # The import stays inside the branch that uses it: on SM120
+        # flash_mla_sparse_fwd is not built, so importing it unconditionally
+        # would break the Triton route this method also serves.
+        if not _dsv4_triton_sparse_prefill:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
-        # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
+        # q is (b, 1, h_q, d_qk); both kernels take (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
-
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -1860,6 +1931,35 @@ class DeepseekV4AttnBackend(
             out=swa_slice,
         )
         kv = workspace
+
+        if _dsv4_triton_sparse_prefill:
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+                sparse_mla_prefill,
+            )
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_is_capture_mode,
+            )
+
+            # The union path sizes its scratch from the observed index range,
+            # which costs one device-to-host read and cannot be graph-captured.
+            # Fall back to the per-token path under capture: same result.
+            union = 0 if get_is_capture_mode() else _dsv4_triton_union
+            # The sink is built and cached at the padded head count, but this
+            # route may be handed unpadded q (the Triton kernel needs no head
+            # padding). Its first n_local_heads entries are the real ones, so
+            # trimming to whatever q carries is correct either way.
+            if attn_sink is not None and attn_sink.shape[0] != q_flat.shape[1]:
+                attn_sink = attn_sink[: q_flat.shape[1]].contiguous()
+            return sparse_mla_prefill(
+                q_flat,
+                kv,
+                combined_indices,
+                self.softmax_scale,
+                self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+                union=union,
+            )
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,

@@ -194,6 +194,11 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+# When the Triton sparse-MLA kernel consumes the prefill query, the head count
+# does not need padding: it pads into a 16-row mma tile rather than into the
+# grid. Read once, like the other capability flags.
+_DSV4_TRITON_SPARSE_PREFILL = envs.SGLANG_DSV4_TRITON_SPARSE_PREFILL.get()
+
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
@@ -1132,6 +1137,18 @@ class MQALayer(MqaAttentionBase):
         # sliced back off (plus a .contiguous() copy) in the backend, so
         # size q to the real local heads there instead.
         skip_decode_pad = no_pad_threshold is not None and x.shape[0] > no_pad_threshold
+        # Same conclusion for the Triton sparse-MLA prefill route, reached for
+        # a different reason: that kernel pads into a 16-row mma tile rather
+        # than into the grid, so it needs no head padding at any h_q. It runs
+        # only on the extend path, which is the same gate the backend uses.
+        # (On this fork the SM120 threshold above already covers every prefill
+        # chunk longer than 64 tokens, so this OR is usually inert -- it is
+        # ported so the route is correct on a tree without that fix, and so a
+        # short prefill chunk is unpadded too.)
+        if _DSV4_TRITON_SPARSE_PREFILL and (
+            forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            skip_decode_pad = True
         if self.tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
