@@ -87,37 +87,40 @@ Every number below is **ours ÷ baseline**.
 
 | input len | concurrency | throughput (higher better) | TTFT (lower better) | TPOT run 1 | TPOT run 2 | **TPOT mean (lower better)** |
 |---|---|---|---|---|---|---|
-| 1024 | 8 | 1.031 | 1.002 | 0.966 | 0.975 | **0.970** |
-| 1024 | 32 | 1.034 | 1.024 | 0.959 | 0.968 | **0.964** |
-| 1024 | 64 | 1.039 | 1.015 | 0.953 | 0.962 | **0.958** |
-| 8192 | 8 | 1.026 | 1.016 | 0.962 | 0.975 | **0.968** |
-| 8192 | 32 | 1.013 | 1.019 | 0.964 | 0.982 | **0.973** |
-| 8192 | 64 | 1.001 | 1.024 | 0.972 | 0.998 | **0.985** |
+| 1024 | 8 | 1.032 | 0.976 | 0.965 | 0.975 | **0.970** |
+| 1024 | 32 | 1.044 | 0.989 | 0.945 | 0.968 | **0.956** |
+| 1024 | 64 | 1.046 | 0.985 | 0.944 | 0.962 | **0.953** |
+| 8192 | 8 | 1.034 | 0.991 | 0.952 | 0.975 | **0.964** |
+| 8192 | 32 | 1.030 | 0.976 | 0.949 | 0.982 | **0.966** |
+| 8192 | 64 | 1.034 | 0.970 | 0.937 | 0.998 | **0.968** |
 
-**TPOT 1.5% to 4.2% better, at every one of the six points.**
+**TPOT 3.0% to 4.7% better, at every one of the six points.** Throughput
++3.0% to +4.6%. TTFT is not a target here (the prefill switch is off) and lands
+slightly under 1.0 at every point.
 
 > **How much to trust a single row.** Swapping the two servers onto the other
-> half of the node moves TPOT by **±1.4 percentage points** on its own (run 2
-> minus run 1, range +0.9 to +2.6). That is the resolution of this experiment.
-> Read the mean column; treat anything under ~1.5 pp as unresolved. We learned
+> half of the node moves TPOT by **+2.8 percentage points on average** (run 2
+> minus run 1, range +1.0 to +6.1). That is the resolution of this experiment.
+> Read the mean column; treat anything under ~3 pp as unresolved. We learned
 > this the hard way — a kernel change looked 0.6 pp better on one placement and
-> turned out to be 0.1 pp [−0.2, +0.3], i.e. nothing, once both were run.
+> turned out to be nothing once both were run.
 
 ### 3b. Decode in isolation
 
 | concurrency | throughput run 1 | throughput run 2 | TPOT run 1 | TPOT run 2 |
 |---|---|---|---|---|
-| 8 | 1.034 | 1.047 | 0.966 | 0.949 |
-| 64 | 1.034 | 1.049 | 0.966 | 0.950 |
+| 8 | 1.035 | 1.047 | 0.961 | 0.949 |
+| 64 | 1.043 | 1.049 | 0.957 | 0.950 |
 
 ### 3c. Prefill in isolation — output len 1, concurrency 1, so no queueing
 
 | input len | TTFT run 1 | TTFT run 2 |
 |---|---|---|
-| 1024 | 0.983 | 0.997 |
-| 8192 | 0.998 | 1.010 |
+| 1024 | 0.972 | 0.997 |
+| 8192 | 0.963 | 1.010 |
 
-**Neutral** — lands on both sides of 1.00 in the two runs.
+**Neutral** — lands on both sides of 1.00 across the two runs, and the spread
+between placements is larger than the effect.
 
 Why, measured rather than argued: CUDA-event timing inside the running server
 shows the kernel *is* **1.565x** there (baseline 484.5 µs kernel + 105.1 µs page
@@ -189,9 +192,16 @@ is the expected answer, not a defect. It is fixed by DSv4's `d=512, topk=640`
 and no kernel change moves it. At batch 1–16 neither limit binds: the launch is
 40 thread blocks against 376 slots, **11% of the GPU** — a parallelism limit.
 
-**Ceiling.** Attention is **2.4–7.5% of one decode step**, derived from the A/B
-itself (`share = (1 − TPOT ratio) / (1 − 1/kernel speedup)`). An infinitely fast
-attention kernel would buy −7.5% TPOT at best. We measured −1.5 to −4.2%.
+**Ceiling.** Attention is **5.5–8.6% of one decode step**, derived from the A/B
+itself (`share = (1 − TPOT ratio) / (1 − 1/kernel speedup)`), per config:
+
+| input len | 1024 | 1024 | 1024 | 8192 | 8192 | 8192 |
+|---|---|---|---|---|---|---|
+| concurrency | 8 | 32 | 64 | 8 | 32 | 64 |
+| attention share of a decode step | 5.5% | 8.1% | 8.6% | 6.7% | 6.4% | 5.9% |
+
+An infinitely fast attention kernel would buy **−8.6% TPOT at best**. We measured
+−3.0 to −4.7%, i.e. **roughly half of what is there to take**.
 
 ---
 

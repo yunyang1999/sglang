@@ -124,28 +124,35 @@ matter more than we expected — see the note under the table.
 
 | ISL | CC | tput B/A | TTFT B/A | TPOT R1 | TPOT R2 | **TPOT mean** |
 |---|---|---|---|---|---|---|
-| 1024 | 8 | 1.031 | 1.002 | 0.966 | 0.975 | **0.970** |
-| 1024 | 32 | 1.034 | 1.024 | 0.959 | 0.968 | **0.964** |
-| 1024 | 64 | 1.039 | 1.015 | 0.953 | 0.962 | **0.958** |
-| 8192 | 8 | 1.026 | 1.016 | 0.962 | 0.975 | **0.968** |
-| 8192 | 32 | 1.013 | 1.019 | 0.964 | 0.982 | **0.973** |
-| 8192 | 64 | 1.001 | 1.024 | 0.972 | 0.998 | **0.985** |
+| 1024 | 8 | 1.032 | 0.976 | 0.965 | 0.975 | **0.970** |
+| 1024 | 32 | 1.044 | 0.989 | 0.945 | 0.968 | **0.956** |
+| 1024 | 64 | 1.046 | 0.985 | 0.944 | 0.962 | **0.953** |
+| 8192 | 8 | 1.034 | 0.991 | 0.952 | 0.975 | **0.964** |
+| 8192 | 32 | 1.030 | 0.976 | 0.949 | 0.982 | **0.966** |
+| 8192 | 64 | 1.034 | 0.970 | 0.937 | 0.998 | **0.968** |
 
-**TPOT 0.958–0.985 — 1.5 to 4.2% better, at every one of the six points.**
+**TPOT 0.953–0.970 — 3.0 to 4.7% better, at every one of the six points.**
+
+> These replaced an earlier set (0.958–0.985) that was wrong for a reason worth
+> repeating: `bench_serving --output-file` **appends**, and re-running a cell
+> writes to the same filename, so each file had accumulated one record per run
+> that ever touched it. The collector read them all and silently averaged this
+> build together with two or three older ones, dragging the result toward the
+> slower builds. It now takes only the record the current run appended. Nothing
+> was re-run for this correction -- the data was always there, aggregated wrong.
 
 **How much to trust a difference this size.** The placement swap alone moves
-TPOT by **+1.4 pp on average** (R2 − R1, range +0.9 to +2.6). That is the
+TPOT by **+2.8 pp on average** (R2 − R1, range +1.0 to +6.1). That is the
 resolution of this experiment, and it is worth stating because it is *larger
 than some changes we were tempted to claim*: an earlier kernel revision
 measured at one placement looked +0.6 pp better, and running the other
-placement showed the real effect was +0.1 pp [−0.2, +0.3] — i.e. nothing. Read
-the mean column, not a single row, and treat anything under ~1.5 pp here as
-unresolved.
+placement showed it was nothing. Read the mean column, not a single row, and
+treat anything under ~3 pp here as unresolved.
 
-**LEVEL 3 — decode alone**: tput B/A 1.034 / 1.034 (R1) and 1.047 / 1.049 (R2);
-TPOT 0.966 / 0.966 and 0.949 / 0.950, at CC 8 / 64.
+**LEVEL 3 — decode alone**: tput B/A 1.035 / 1.043 (R1) and 1.047 / 1.049 (R2);
+TPOT 0.961 / 0.957 and 0.949 / 0.950, at CC 8 / 64.
 
-**LEVEL 2 — prefill alone** (CC 1, so no queueing): TTFT B/A 0.983 / 0.998 (R1)
+**LEVEL 2 — prefill alone** (CC 1, so no queueing): TTFT B/A 0.972 / 0.963 (R1)
 and 0.997 / 1.010 (R2), for ISL 1024 / 8192. Straddles 1.0 in both placements:
 **prefill is neutral at the request level, neither better nor worse.** Why, with
 the measurement, is under "Caveats".
@@ -349,30 +356,32 @@ column reads above 1.0 in places, but at ISL 8192 / CC 64 that TTFT is 21 s for
 a prefill that computes in well under a second, so LEVEL 1 TTFT is dominated by
 queueing under `rate inf` and is not a prefill measurement at all. LEVEL 2 is.
 
-**The decode ceiling is 2.4–7.5%, and we are at most of it.** Derived from your
-own A/B rather than estimated: both arms differ only in the attention kernel, so
-the whole TPOT delta is attention, and `attention share = (1 - TPOT_B/A) /
-(1 - 1/s)` where `s` is the kernel speedup at that config's per-rank batch.
+**The decode ceiling is 5.5–8.6%, and we are at about half of it.** Derived from
+your own A/B rather than estimated: both arms differ only in the attention
+kernel, so the whole TPOT delta is attention, and `attention share =
+(1 - TPOT_B/A) / (1 - 1/s)` where `s` is the kernel speedup at that config's
+per-rank batch.
 
 | ISL | CC | per-rank B | TPOT B/A | s | attention share | ceiling on TPOT | needed for −5% |
 |---|---|---|---|---|---|---|---|
-| 1024 | 8 | 2 | 0.967 | 2.20 | 6.1% | −6.1% | 5.8x |
-| 1024 | 32 | 8 | 0.961 | 2.16 | 7.3% | −7.3% | 3.2x |
-| 1024 | 64 | 16 | 0.959 | 2.22 | 7.5% | −7.5% | 3.0x |
-| 8192 | 8 | 2 | 0.967 | 2.20 | 6.1% | −6.1% | 5.8x |
-| 8192 | 32 | 8 | 0.971 | 2.16 | 5.4% | −5.4% | 13.5x |
-| 8192 | 64 | 16 | 0.987 | 2.22 | **2.4%** | −2.4% | impossible |
+| 1024 | 8 | 2 | 0.970 | 2.20 | 5.5% | −5.5% | 11.0x |
+| 1024 | 32 | 8 | 0.956 | 2.16 | 8.1% | −8.1% | 2.6x |
+| 1024 | 64 | 16 | 0.953 | 2.22 | 8.6% | −8.6% | 2.4x |
+| 8192 | 8 | 2 | 0.964 | 2.20 | 6.7% | −6.7% | 3.9x |
+| 8192 | 32 | 8 | 0.966 | 2.16 | 6.4% | −6.4% | 4.6x |
+| 8192 | 64 | 16 | 0.968 | 2.22 | 5.9% | −5.9% | 6.6x |
 
 Attention is a **single-digit percentage of a decode step** in a 43-layer MoE —
-the other 92–98% is MoE GEMMs, the indexer, dispatch/combine and the rest of the
-block. An *infinitely fast* attention kernel buys −7.5% at the best of these
-points and −2.4% at the worst. **−5% end to end is not reachable from an
-attention kernel here**, and no amount of tile tuning changes that.
+the other 91–95% is MoE GEMMs, the indexer, dispatch/combine and the rest of the
+block. An *infinitely fast* attention kernel buys −8.6% at the best of these
+points and −5.5% at the worst. **−5% end to end is out of reach at four of the
+six points**, and no amount of tile tuning changes that.
 
-This also explains the shape of the e2e table: the config where attention
-matters least (ISL 8192, CC 64, share 2.4%) is exactly the one where TPOT barely
-moved (0.987), and the configs where it matters most are where we gained most.
-The kernel's 2.2x is being applied to a small slice, and 2.2x on 7% is 3.8%.
+It also explains the shape of the e2e table, since the two track each other:
+the config where attention weighs most (ISL 1024, CC 64, share 8.6%) is where
+TPOT moved most (0.953), and the one where it weighs least (ISL 1024, CC 8,
+5.5%) is where it moved least (0.970). The kernel's 2.2x is being applied to a
+single-digit slice, and 2.2x on 7% is about 3.8% — which is what the table says.
 
 **The advantage narrows with batch and with head count** — 2.20x at B=1 down to
 1.29x at B=128. The mechanism is head tiling's own cost: each token's KV is
