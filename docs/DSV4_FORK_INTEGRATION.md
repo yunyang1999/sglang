@@ -543,6 +543,29 @@ above that argued from memory-traffic counts both measured slower.
   head-to-heads passed while the server could not start.
   `test_sliced_pool_matches_contiguous` covers it now.
 
+## Reproducing any of it
+
+Every number in these documents came from a probe under
+`/home/scratch.yuny_wwfo/nsa_kernel/probe` (NVIDIA-internal path). The ones
+behind the headline figures:
+
+    probe_h2h_native_grid.py       the FlashInfer head-to-head, all axes
+    probe_tflops_roofline.py       achieved TFLOP/s and the roofline denominators
+    probe_merge_warps_repro.py     the SPLIT_PAD merge rule, quantisation removed
+    probe_prefill_ttft_budget.py   the workspace-vs-attention split in prefill
+    probe_native_head_tile.py      head-tiling equivalence
+    probe_native_tile_sweep.py     the split-kernel tile and warp sweep
+    probe_batch_adaptive.py        per-batch (BLOCK_H, BLOCK_N, splits) optimum
+    aot_sm120_*.py                 host-side sm_120 resource reads, no GPU needed
+
+The end-to-end harness is `/home/scratch.yuny_wwfo_1/xutizhou_ab` --
+`scripts/11_ab.sbatch` runs both arms, `scripts/30_collect.py` builds the tables.
+Two things it is worth knowing before re-running: the arms must go to different
+HTTP ports at least 5 apart (SGLang takes 5 consecutive ports from
+`port + ZMQ_TCP_PORT_DELTA`, which is what made an earlier attempt collide), and
+each round writes to `results/round$ROUND`, so two jobs with the same ROUND
+silently overwrite each other -- that is how one earlier dataset was lost.
+
 ## Files here
 
     RESULTS.md                             every number on one page, start here
