@@ -1245,6 +1245,75 @@ def _dense_prefix_path(
 # would let the cache grow without bound over a server's lifetime. Buffers grow
 # in place when a larger batch arrives, so the entry count stays bounded by the
 # span buckets a model can reach.
+# Group-level gate on the union path, as a union-ratio threshold.
+#
+# The union is otherwise all-or-nothing: measured 1.76x at 97% neighbour
+# retention of the top-k half, 0.86x at 50%, and 0.36x on uniformly random
+# indices, where every row is owned by exactly one token and the [G*H, BLOCK_N]
+# mma spends (G-1)/G of its rows on -inf.
+#
+# The threshold is not fitted. `union_ratio = G / E[popcount]` is an identity, so
+# the union length compact already produces carries the same information as the
+# ownership histogram. Measuring the marginal cost of one gathered row in each
+# kernel (both shipped, unmodified, launched twice on identical input with real
+# vs zero lengths so the prologue and epilogue cancel) gives a union row costing
+# `p* = 2.02` base-path rows on the GLM shape and 2.12 on DSv4's. A group is
+# therefore worth unioning iff it gathers fewer than `G / p*` rows per token --
+# 1.95 at G=4 -- and 1.9 measures as the optimum.
+#
+# Measured on this implementation, RTX 5080 sm_120, one run, job 3830871.
+# `base` is the per-token kernel; `union` is this path with the gate disabled.
+#
+#     case                ratio   gate      g/union   g/base
+#     GLM  k2048 .97      1.069   KEEP        0.993    1.607
+#     GLM  k2048 .90      1.214   KEEP        0.999    1.443
+#     GLM  k2048 .50      1.908   DECLINE     1.046    0.987
+#     GLM  k2048 random   3.106   DECLINE     1.713    0.988
+#     DSv4 k640  .90      1.202   KEEP        1.006    1.338
+#     DSv4 k640  random   2.836   DECLINE     1.553    0.977
+#
+# Keeping is free (0.993-1.006 of the ungated path) and declining lands at
+# 0.977-0.988 of the per-token kernel instead of the 0.577-0.629 the ungated
+# path measured on the same inputs. Exactness is not a tolerance: a kept call is
+# bitwise equal to the ungated union and a declined call bitwise equal to the
+# per-token kernel, checked at every case.
+#
+# `_UNION_GATE_EVERY` sets the floor, swept in the same run:
+#
+#     every        1       16       64      256
+#     GLM random   0.856   0.988    0.994   0.994
+#     DSv4 random  0.788   0.977    0.987   0.987
+#
+# 16 takes essentially all of it; 64 buys 0.6 pp more floor for four times the
+# staleness window, which is not a trade worth making.
+## Set to 0 or None to restore the ungated all-or-nothing behaviour.
+_UNION_GATE = 1.9
+
+# What the gate last saw. Host-side only, so it costs nothing on the device and
+# nothing inside a captured graph; it exists so a sweep can tell a call that was
+# declined from one that never reached the gate.
+_LAST_UNION_RATIO = float("nan")
+
+# How often the gate actually asks. The decision needs the union length, and
+# reading it is a device-to-host sync -- `_union_path` already pays one for the
+# index range, and a second measured 2.4-6.0% of the *kept* call, which is worse
+# than useless because real captured indices never decline (their ratios run
+# 1.019-1.598 against a 1.9 threshold). Re-checking every Nth call amortises
+# that to 1/N while still catching a workload that changes shape, since the
+# decision is stable across the layers of one forward even though their
+# individual ratios are not: they all sit on the same side of the threshold.
+# 1 asks every time, i.e. the unamortised behaviour.
+#
+# The cost of being wrong for a window: a stale *keep* runs the ungated union,
+# which on uniformly random indices measured 0.577x of the per-token path, for at
+# most N-1 calls before the next refresh. A stale *decline* merely forgoes the
+# win. The key is (G, K, device), so all layers of a forward share one decision;
+# their individual ratios differ (1.16 to 1.60 on the real capture) but sit on
+# the same side of the threshold, which is what makes one decision serve them.
+_UNION_GATE_EVERY = 16
+_UNION_GATE_CACHE = {}
+
+
 _UNION_WS = {}
 _UNION_SPAN_BUDGET = 512 << 20  # bytes for the [NG, span] int32 mark map
 
@@ -1389,7 +1458,8 @@ def _nsa_prefill_union_kernel(
 
 
 def _union_path(
-    q, kv, indices, sm_scale, d_v, out, G, union_config=None, attn_sink=None
+    q, kv, indices, sm_scale, d_v, out, G, union_config=None, attn_sink=None,
+    topk_length=None, union_gate=None,
 ):
     """Returns True if handled. Budget-gated; tail rows (T % G) fall back."""
     T, h, d_qk = q.shape
@@ -1401,6 +1471,30 @@ def _union_path(
     T_main = (T // G) * G
     if T_main == 0:
         return False
+
+    if union_gate is None:
+        union_gate = _UNION_GATE
+    # Not `key`: the workspace lookup below binds that name to a different
+    # tuple, and sharing it silently made this cache read one key and write
+    # another -- every call came back a miss, which showed up as the refresh
+    # interval having no effect at all.
+    gate_key = (G, K, q.device)
+    fresh = True
+    if union_gate:
+        seen, decision = _UNION_GATE_CACHE.get(gate_key, (0, None))
+        if decision is not None and seen % max(1, _UNION_GATE_EVERY):
+            _UNION_GATE_CACHE[gate_key] = (seen + 1, decision)
+            if not decision:
+                # Taken here, before anything else, because everything below is
+                # work a decline discards -- and not only the mark and compact
+                # passes. Ahead of them sit an amin and an amax over the whole
+                # index tensor, the host sync that reads them, and a contiguous
+                # copy of it (32 MB at T=4096, topk=2048). Placing this check
+                # after compact instead left the declining case at 0.905-0.943x
+                # of the per-token path even at a 0.4% refresh rate, which is how
+                # that setup cost was found.
+                return False
+            fresh = False  # cached keep; skip the re-measure after compact
     # single fused reduction + ONE host sync (amax is -1-safe; amin masks -1 to INT_MAX)
     vmin_t = torch.where(
         indices >= 0,
@@ -1458,6 +1552,45 @@ def _union_path(
         STAGES=4,
         num_warps=4,
     )
+
+    if union_gate and fresh:
+        # Measured here, after compact, because compact's output is needed
+        # anyway when the path is kept -- so a kept call pays nothing extra.
+        #
+        # Deciding *before* mark and compact, from a strided sample of groups,
+        # was built and measured first and is worse. It lifts the declining case
+        # from 0.843-0.919x to 0.918-0.919x of the per-token path, but charges
+        # the duplicated sample to every *kept* call: measured 0.965 / 0.968 on
+        # the GLM shape and 0.905 on DSv4's, against the ungated union. That
+        # trade is backwards, because real captured indices never decline --
+        # their union ratios run 1.019-1.598 against a 1.9 threshold. The sampled
+        # variant taxes every real call to insure against a case real data does
+        # not reach.
+        #
+        # `union_ratio = G / E[popcount]` is an identity, so the union length is
+        # the ownership histogram without materialising it. A group is worth
+        # unioning iff it gathers fewer than `G / p*` rows per token, where one
+        # union row measured `p* = 2.02` base-path rows on the GLM shape and 2.12
+        # on DSv4's -- 1.95 at G=4, and 1.9 measures as the optimum.
+        if topk_length is not None:
+            l_sum = topk_length[:T_main].to(torch.int64).sum()
+        else:
+            # No real length: the row width is the only bound available, and
+            # it understates the ratio on a padded call, i.e. errs toward
+            # keeping.
+            l_sum = torch.tensor(T_main * K, dtype=torch.int64,
+                                 device=q.device)
+        u_tot, l_tot = torch.stack(
+            [ulen.to(torch.int64).sum(), l_sum]
+        ).tolist()
+        ratio = (G * u_tot / l_tot) if l_tot else float("inf")
+        global _LAST_UNION_RATIO
+        _LAST_UNION_RATIO = ratio
+        decision = ratio < union_gate
+        _UNION_GATE_CACHE[gate_key] = (seen + 1, decision)
+        if not decision:
+            return False  # caller falls through to the per-token path
+
     if union_config is not None:
         bn, warps, stages = union_config
     elif torch.cuda.get_device_capability(q.device)[0] >= 12:
@@ -1809,7 +1942,8 @@ def sparse_mla_prefill(
             return out
 
     if union in (2, 4) and _union_path(
-        q, kv, indices, sm_scale, d_v, out, union, union_config, attn_sink=attn_sink
+        q, kv, indices, sm_scale, d_v, out, union, union_config,
+        attn_sink=attn_sink, topk_length=topk_length,
     ):
         return out
 
@@ -2971,6 +3105,65 @@ _MERGE_LOOP_SPLITS: bool = False
 # diverged at B=32, which was not chased once the speed answer was in.)
 # Reverted rather than left behind a flag: it is invasive plumbing through two
 # kernels for a loss.
+#
+# H2 -- fix global-load coalescing on the KV gather. **Dead, and now bounded
+# rather than argued about** (probe/sau_ncu_h1h2.py, job 3829569; RTX 5080 /
+# sm_120 / 84 SMs, H=64, topk=640, CUDA-graph replay).
+#
+# NCU: "only 22.0 of the 32 bytes transmitted per sector are utilized"
+# (Est. 13.67%), "1,718,444 excessive sectors, 19% of the total 8,924,948"
+# (Est. 16.02%), on `L1/TEX 50.92%`, the most-loaded unit. The mechanism offered
+# was that the row stride is ~584 B and so not a multiple of 32, and the fix was
+# to pad it to 640 B.
+#
+# **The premise is arithmetically false.** A row is 448 fp8 + 64 bf16 = 576 B =
+# 18 x 32 B = 9 x 64 B -- already sector- and 64 B-aligned. 584 is the per-token
+# footprint *including* the 8-byte ue8m0 slot, and that slot is not between the
+# rows: it lives in the page's scale footer at `S_OFFSET_BYTES`. Sector
+# accounting for one BLOCK_N=64 tile:
+#
+#     7 fp8 chunks   64 rows x  64 B contiguous ->  896 sectors, 32.0 B each
+#     rope tail      64 rows x 128 B contiguous ->  256 sectors, 32.0 B each
+#     ue8m0 footer   7 loads x 64 GATHERED rows ->  448 sectors,  1.0 B each
+#     indices        64 x int32 contiguous      ->    8 sectors, 32.0 B each
+#     ---------------------------------------------------------------------
+#     1,608 sectors for 37,568 useful bytes = 23.4 B/sector, vs NCU's 22.0
+#
+# So the whole sector deficit is the footer -- 28% of the tile's sectors
+# carrying one byte each -- and padding the row stride cannot touch it, because
+# the fp8 and rope loads are already at 32/32. Measured anyway, through the
+# `row_bytes` argument, against a pool holding bit-identical logical rows at a
+# 640 B stride: **0.9998x on the production mix, 0.9976x gmean over B, and
+# +11.0% of KV pool bytes.** Output `torch.equal` either way, so the experiment
+# is exact rather than approximate.
+#
+# The footer itself was then bounded three ways with `_abl_scale`, which moves
+# only the scale *address* so that instruction count, dequant and every
+# dependency are held still (modes 1 and 2), or deletes the load and its dequant
+# outright (mode 3). Sectors spent on the footer per tile: 448 -> 112 -> 7 -> 0.
+#
+#     mode                    production mix   B >= 64
+#     1  contiguous rows          1.0185x      1.0431x
+#     2  one shared byte          1.0186x      1.0410x   <- ceiling for ANY
+#                                                           wide-load scheme
+#     3  load and dequant gone    1.0767x      1.3378x
+#
+# Mode 2 is the floor of the address space -- one sector per load -- so **no
+# coalescing fix of any kind can be worth more than 1.9% on the mix**, against
+# NCU's 13.67-16.02%. That is the third time this kernel's Est. Speedup has been
+# high by a wide margin, and it also explains the 0.906x above: the int64 load
+# was chasing at most 1.9% and paid a serial dependency for it.
+#
+# The gap between mode 2 and mode 3 is the interesting part: **seven eighths of
+# what the ue8m0 footer costs is arithmetic, not traffic** -- the `exp2`, the
+# `qsc[:, None] * ksc[None, :]` outer product on the logit tile, and the
+# `p * ksc` in `_pv_chunk`. Neither existing lever recovers it (job 3829673):
+# `qk_scaled=True`, which is supposed to lower to
+# `mma.sync...block_scale...ue8m0` and emit no dequant at all, measures
+# **0.4642x** on the mix and 0.2415x at B >= 64, and `pv_rowmax=False` measures
+# 0.9967x. Both are accurate (cos 0.99943-0.99947 against the bf16 gather); they
+# are simply slow. So the arithmetic is real, and there is no cheap way at it
+# from here -- which is a live lead, not a closed one.
 
 
 def _merge_heads(device, T, h):
@@ -3170,33 +3363,55 @@ def _has_fp8_mma(device=None):
 
 
 @triton.jit
-def _kv_chunk(
-    fp8_ptr, u8_ptr, base, sbase, valid, col,
-    I: tl.constexpr, SCALE_TILE: tl.constexpr, BLOCK_N: tl.constexpr,
+def _kv_bytes(
+    fp8_ptr, base, valid, col, I: tl.constexpr, SCALE_TILE: tl.constexpr,
 ):
-    """One 64-wide fp8 chunk and its ue8m0 dequant scale, both at true width.
-
-    The tile is returned as fp8 and never converted, so it can be an mma operand
-    in either orientation. The scale is one byte per row, not a [BLOCK_N, 512]
-    broadcast.
-    """
-    kv = tl.load(
+    """One 64-wide fp8 chunk at true width, never converted, so it can be an
+    mma operand in either orientation."""
+    return tl.load(
         fp8_ptr + base[:, None] + I * SCALE_TILE + col[None, :],
         mask=valid[:, None],
         other=0.0,
     )
+
+
+@triton.jit
+def _kv_dequant(eb, BLOCK_N: tl.constexpr, SCALE_TILE: tl.constexpr):
+    """The two forms one stored ue8m0 byte reaches the maths in."""
     # ue8m0 is a biased power-of-two exponent, so dequant is exp2, not a
     # multiply by a stored float. 255 is the non-finite encoding; clamping keeps
     # a corrupt footer from turning the whole tile into NaN.
-    eb = tl.load(u8_ptr + sbase + I, mask=valid, other=0)
     e = eb.to(tl.float32)
     # tl.dot_scaled wants the B scale as [N, K//32]; one stored byte covers
     # SCALE_TILE=64 values, i.e. two 32-wide mma scale blocks.
     return (
-        kv,
         tl.exp2(tl.minimum(e, 254.0) - 127.0),
         tl.broadcast_to(eb[:, None], (BLOCK_N, SCALE_TILE // 32)),
     )
+
+
+@triton.jit
+def _kv_chunk(
+    fp8_ptr, u8_ptr, base, sbase, valid, col,
+    I: tl.constexpr, SCALE_TILE: tl.constexpr, BLOCK_N: tl.constexpr,
+    ABL_SCALE: tl.constexpr = 0,
+):
+    """One 64-wide fp8 chunk and its ue8m0 dequant scale, both at true width.
+
+    The scale is one byte per row, not a [BLOCK_N, 512] broadcast.
+
+    ``ABL_SCALE`` is attribution only and deliberately wrong; see `_native_tile`
+    for what each mode measures. Mode 3 removes the scale load outright, which
+    also constant-folds the dequant -- it is the ceiling on *everything* the
+    ue8m0 footer costs, load and maths together.
+    """
+    kv = _kv_bytes(fp8_ptr, base, valid, col, I, SCALE_TILE)
+    if ABL_SCALE == 3:
+        eb = (tl.zeros([BLOCK_N], tl.int32) + 127).to(tl.uint8)
+    else:
+        eb = tl.load(u8_ptr + sbase + I, mask=valid, other=0)
+    c, u = _kv_dequant(eb, BLOCK_N, SCALE_TILE)
+    return kv, c, u
 
 
 @triton.jit
@@ -3289,6 +3504,7 @@ def _native_tile(
     PV_ROWMAX: tl.constexpr,
     ABL_LOAD: tl.constexpr,
     ABL_DOT: tl.constexpr,
+    ABL_SCALE: tl.constexpr = 0,
 ):
     """One KV tile: gather, QK, online softmax, PV. Returns the updated state.
 
@@ -3310,13 +3526,30 @@ def _native_tile(
     sbase = (
         page * BYTES_PER_PAGE + S_OFFSET_BYTES + in_page * SCALE_BYTES_PER_TOKEN
     )
+    # ---- ABL_SCALE: attribution only, and deliberately wrong ----------------
+    # The ue8m0 footer is loaded one byte per row per chunk, and the rows are a
+    # *gather*, so each of the seven loads pulls BLOCK_N distinct 32-byte sectors
+    # to use BLOCK_N bytes. That is 7 x BLOCK_N of the tile's ~25 x BLOCK_N
+    # sectors -- 28% of them -- carrying 1/32 of a sector each, and it is the
+    # whole of NCU's "only 22.0 of 32 bytes per sector are utilized". These modes
+    # move only the *address*, so the instruction count, the dequant and every
+    # dependency stay exactly as they are and the delta is pure coalescing:
+    #   1  tile-local contiguous rows (stride SCALE_BYTES_PER_TOKEN): what a
+    #      perfectly sequential gather of this same layout would cost, 16
+    #      sectors per load instead of BLOCK_N.
+    #   2  every lane reads the same byte: one sector per load, the floor.
+    # Mode 3 lives in `_kv_chunk` and deletes the load outright.
+    if ABL_SCALE == 1:
+        sbase = S_OFFSET_BYTES + tl.arange(0, BLOCK_N) * SCALE_BYTES_PER_TOKEN
+    if ABL_SCALE == 2:
+        sbase = S_OFFSET_BYTES + tl.zeros([BLOCK_N], tl.int32)
 
     # ---- gather -----------------------------------------------------------
     # Explicitly unrolled: Triton 3.6 rejects Python list mutation inside
     # tl.static_range, so the seven chunks are named values. Nothing here is
     # converted or selected -- k0..k6 stay fp8 all the way into the mma, in both
     # orientations.
-    k0, c0, u0 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 0, SCALE_TILE, BLOCK_N)
+    k0, c0, u0 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 0, SCALE_TILE, BLOCK_N, ABL_SCALE)
     if ABL_LOAD:
         # Attribution only, and deliberately wrong: chunk 0 stands in for all
         # seven, so every dot, reduction and quantisation still happens and the
@@ -3329,12 +3562,12 @@ def _native_tile(
         k5, c5, u5 = k0, c0, u0
         k6, c6, u6 = k0, c0, u0
     else:
-        k1, c1, u1 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 1, SCALE_TILE, BLOCK_N)
-        k2, c2, u2 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 2, SCALE_TILE, BLOCK_N)
-        k3, c3, u3 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 3, SCALE_TILE, BLOCK_N)
-        k4, c4, u4 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 4, SCALE_TILE, BLOCK_N)
-        k5, c5, u5 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 5, SCALE_TILE, BLOCK_N)
-        k6, c6, u6 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 6, SCALE_TILE, BLOCK_N)
+        k1, c1, u1 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 1, SCALE_TILE, BLOCK_N, ABL_SCALE)
+        k2, c2, u2 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 2, SCALE_TILE, BLOCK_N, ABL_SCALE)
+        k3, c3, u3 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 3, SCALE_TILE, BLOCK_N, ABL_SCALE)
+        k4, c4, u4 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 4, SCALE_TILE, BLOCK_N, ABL_SCALE)
+        k5, c5, u5 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 5, SCALE_TILE, BLOCK_N, ABL_SCALE)
+        k6, c6, u6 = _kv_chunk(fp8_ptr, u8_ptr, base, sbase, valid, col, 6, SCALE_TILE, BLOCK_N, ABL_SCALE)
     # The rope tail gets its own 64-wide load rather than riding a full-width
     # [BLOCK_N, 512] masked one.
     rope = tl.load(
@@ -3383,7 +3616,9 @@ def _native_tile(
 
 
 @triton.jit
-def _nsa_prefill_paged_fp8_native_kernel(
+def _native_unsplit_program(
+    t,
+    hb,
     q_ptr,
     fp8_ptr,  # pool bytes viewed as float8_e4m3
     bf16_ptr,  # the same bytes viewed as bfloat16 (the rope tail)
@@ -3421,16 +3656,22 @@ def _nsa_prefill_paged_fp8_native_kernel(
     PV_ROWMAX: tl.constexpr,
     ABL_LOAD: tl.constexpr,
     ABL_DOT: tl.constexpr,
+    ABL_SCALE: tl.constexpr = 0,
 ):
-    t = tl.program_id(0)
-    D: tl.constexpr = D_NOPE + D_ROPE
+    """One (token, head tile) of the unsplit kernel, as an inlined program.
 
-    # Head tile, as in `_nsa_prefill_kernel`: grid dim 1 is ceil(H / BLOCK_H), so
-    # a program owns one (token, head tile) rather than one token. Every use of
-    # `h` below -- q, sink, output -- is already an ABSOLUTE head index, so
-    # offsetting it here is the whole change. With BLOCK_H >= H the grid dim is
-    # 1, `hb` is 0, and this is bit for bit the untiled kernel.
-    hb = tl.program_id(1)
+    Split out of `_nsa_prefill_paged_fp8_native_kernel` so that the persistent
+    launch can run several of these per thread block; the ordinary launch calls
+    it exactly once and is unchanged bit for bit. ``t`` and ``hb`` used to be
+    `tl.program_id(0)` and `(1)`.
+
+    Head tile, as in `_nsa_prefill_kernel`: a program owns one (token, head
+    tile) rather than one token. Every use of `h` below -- q, sink, output -- is
+    already an ABSOLUTE head index, so offsetting it here is the whole change.
+    With BLOCK_H >= H there is one head tile, `hb` is 0, and this is bit for bit
+    the untiled kernel.
+    """
+    D: tl.constexpr = D_NOPE + D_ROPE
     h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     hmask = h < H
     col = tl.arange(0, SCALE_TILE)  # lanes within one fp8 chunk
@@ -3477,7 +3718,7 @@ def _nsa_prefill_paged_fp8_native_kernel(
             SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
             S_OFFSET_BYTES=S_OFFSET_BYTES, IDX64=IDX64,
             QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX,
-            ABL_LOAD=ABL_LOAD, ABL_DOT=ABL_DOT,
+            ABL_LOAD=ABL_LOAD, ABL_DOT=ABL_DOT, ABL_SCALE=ABL_SCALE,
         )
 
     if HAS_EXTRA:
@@ -3501,7 +3742,7 @@ def _nsa_prefill_paged_fp8_native_kernel(
                 SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
                 S_OFFSET_BYTES=X_S_OFFSET_BYTES, IDX64=IDX64,
                 QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX,
-            ABL_LOAD=ABL_LOAD, ABL_DOT=ABL_DOT,
+                ABL_LOAD=ABL_LOAD, ABL_DOT=ABL_DOT, ABL_SCALE=ABL_SCALE,
             )
 
     if HAS_SINK:
@@ -3576,7 +3817,10 @@ def _nsa_prefill_paged_fp8_native_kernel(
 
 
 @triton.jit
-def _nsa_decode_split_paged_fp8_native_kernel(
+def _native_split_program(
+    t,
+    s,
+    hb,
     q_ptr,
     fp8_ptr,  # pool bytes viewed as float8_e4m3
     bf16_ptr,  # the same bytes viewed as bfloat16 (the rope tail)
@@ -3613,17 +3857,18 @@ def _nsa_decode_split_paged_fp8_native_kernel(
     IDX64: tl.constexpr,
     QK_SCALED: tl.constexpr,
     PV_ROWMAX: tl.constexpr,
+    ABL_SCALE: tl.constexpr = 0,
 ):
-    """`_nsa_prefill_paged_fp8_native_kernel`'s loop over a slice of the
-    concatenated candidate list. Same body, different bounds, no epilogue."""
-    t = tl.program_id(0)
-    s = tl.program_id(1)
-    D: tl.constexpr = D_NOPE + D_ROPE
+    """`_native_unsplit_program`'s loop over a slice of the concatenated
+    candidate list. Same body, different bounds, no epilogue.
 
-    # Head tile on grid dim 2 -- dims 0 and 1 are already token and split. The
-    # partials are addressed as `mid_o[t, h, s, :]` with an absolute `h`, so
-    # tiling the heads leaves both the layout and `_merge_launch` untouched.
-    hb = tl.program_id(2)
+    One (token, split, head tile), as an inlined program: the ordinary launch
+    calls it once with the three grid ids, the persistent launch calls it in a
+    grid-stride loop. The partials are addressed as `mid_o[t, h, s, :]` with an
+    absolute `h`, so tiling the heads leaves both the layout and
+    `_merge_launch` untouched.
+    """
+    D: tl.constexpr = D_NOPE + D_ROPE
     h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     hmask = h < H
     col = tl.arange(0, SCALE_TILE)  # lanes within one fp8 chunk
@@ -3685,7 +3930,7 @@ def _nsa_decode_split_paged_fp8_native_kernel(
             SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
             S_OFFSET_BYTES=S_OFFSET_BYTES, IDX64=IDX64,
             QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX,
-            ABL_LOAD=False, ABL_DOT=False,
+            ABL_LOAD=False, ABL_DOT=False, ABL_SCALE=ABL_SCALE,
         )
 
     if HAS_EXTRA:
@@ -3707,7 +3952,7 @@ def _nsa_decode_split_paged_fp8_native_kernel(
                 SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
                 S_OFFSET_BYTES=X_S_OFFSET_BYTES, IDX64=IDX64,
                 QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX,
-                ABL_LOAD=False, ABL_DOT=False,
+                ABL_LOAD=False, ABL_DOT=False, ABL_SCALE=ABL_SCALE,
             )
 
     # The eight accumulators tile the 512-wide partial row exactly, so the merge
@@ -3725,6 +3970,271 @@ def _nsa_decode_split_paged_fp8_native_kernel(
     tl.store(ob + 5 * SCALE_TILE + col[None, :], a5.to(ot), mask=hmask[:, None])
     tl.store(ob + 6 * SCALE_TILE + col[None, :], a6.to(ot), mask=hmask[:, None])
     tl.store(ob + D_NOPE + rcol[None, :], ar.to(ot), mask=hmask[:, None])
+
+
+# ---------------------------------------------------------------------------
+# The two launches of `_native_unsplit_program` / `_native_split_program`.
+#
+# `..._kernel` is one program per work item, on the grid the wrapper has always
+# used. `..._persistent_kernel` is `PERSISTENT` H1: a fixed grid of
+# `sm_count * blocks_per_sm` thread blocks that grid-strides the work items
+# itself, so the last wave is never a fraction of one.
+#
+# The linearisation is `wi = t + T * (s + splits * hb)`, which is exactly the
+# order CUDA hands out the ordinary grid (dim 0 fastest). Block `p` therefore
+# takes work items `p, p+P, p+2P, ...`, so the first wave is the same set of
+# items in the same order as today and L2 behaviour is unchanged for it.
+#
+# **Numerics are untouched, by construction.** A work item is a whole program:
+# it carries its own online-softmax state from -inf to its own epilogue and
+# shares nothing with the other items a block runs. Nothing is reassociated,
+# no reduction changes shape, and the head-tile and split boundaries are the
+# same ones. Both persistent kernels are expected to be `torch.equal` to their
+# ordinary counterparts, and the probe asserts it rather than assuming it.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _nsa_prefill_paged_fp8_native_kernel(
+    q_ptr,
+    fp8_ptr,
+    bf16_ptr,
+    u8_ptr,
+    idx_ptr,
+    len_ptr,
+    x_fp8_ptr,
+    x_bf16_ptr,
+    x_u8_ptr,
+    x_idx_ptr,
+    x_len_ptr,
+    o_ptr,
+    sink_ptr,
+    sm_scale,
+    topk,
+    x_topk,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    SCALE_TILE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    X_PAGE_SIZE: tl.constexpr,
+    X_BYTES_PER_PAGE: tl.constexpr,
+    X_S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    IDX64: tl.constexpr,
+    QK_SCALED: tl.constexpr,
+    PV_ROWMAX: tl.constexpr,
+    ABL_LOAD: tl.constexpr,
+    ABL_DOT: tl.constexpr,
+    ABL_SCALE: tl.constexpr,
+):
+    _native_unsplit_program(
+        tl.program_id(0), tl.program_id(1), q_ptr, fp8_ptr, bf16_ptr, u8_ptr,
+        idx_ptr, len_ptr, x_fp8_ptr, x_bf16_ptr, x_u8_ptr, x_idx_ptr,
+        x_len_ptr, o_ptr, sink_ptr, sm_scale, topk, x_topk, H=H,
+        BLOCK_H=BLOCK_H, D_NOPE=D_NOPE, D_ROPE=D_ROPE, SCALE_TILE=SCALE_TILE,
+        PAGE_SIZE=PAGE_SIZE, BYTES_PER_PAGE=BYTES_PER_PAGE,
+        ROW_BYTES=ROW_BYTES, SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+        S_OFFSET_BYTES=S_OFFSET_BYTES, X_PAGE_SIZE=X_PAGE_SIZE,
+        X_BYTES_PER_PAGE=X_BYTES_PER_PAGE, X_S_OFFSET_BYTES=X_S_OFFSET_BYTES,
+        BLOCK_N=BLOCK_N, HAS_EXTRA=HAS_EXTRA, HAS_SINK=HAS_SINK, IDX64=IDX64,
+        QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX, ABL_LOAD=ABL_LOAD,
+        ABL_DOT=ABL_DOT, ABL_SCALE=ABL_SCALE,
+    )
+
+
+@triton.jit
+def _nsa_prefill_paged_fp8_native_persistent_kernel(
+    n_items,
+    T,
+    q_ptr,
+    fp8_ptr,
+    bf16_ptr,
+    u8_ptr,
+    idx_ptr,
+    len_ptr,
+    x_fp8_ptr,
+    x_bf16_ptr,
+    x_u8_ptr,
+    x_idx_ptr,
+    x_len_ptr,
+    o_ptr,
+    sink_ptr,
+    sm_scale,
+    topk,
+    x_topk,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    SCALE_TILE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    X_PAGE_SIZE: tl.constexpr,
+    X_BYTES_PER_PAGE: tl.constexpr,
+    X_S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    IDX64: tl.constexpr,
+    QK_SCALED: tl.constexpr,
+    PV_ROWMAX: tl.constexpr,
+    ABL_LOAD: tl.constexpr,
+    ABL_DOT: tl.constexpr,
+    ABL_SCALE: tl.constexpr,
+):
+    # Constant step of 1 rather than a grid-stride `range(pid, n, nprog)`: the
+    # step of that form is a runtime value, and a loop with a dynamic step is
+    # the one shape of `tl.range` this Triton will not always take.
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    # `loop_unroll_factor=1` is not the default-by-another-name: unrolling a
+    # loop whose body is this whole program would duplicate 255 registers'
+    # worth of state, and the one time this kernel was unrolled (the candidate
+    # loops, factor 2) it measured 0.62x decode for exactly that reason.
+    for i in tl.range(0, tl.cdiv(n_items - pid, nprog), loop_unroll_factor=1):
+        wi = pid + i * nprog
+        _native_unsplit_program(
+            wi % T, wi // T, q_ptr, fp8_ptr, bf16_ptr, u8_ptr, idx_ptr, len_ptr,
+            x_fp8_ptr, x_bf16_ptr, x_u8_ptr, x_idx_ptr, x_len_ptr, o_ptr,
+            sink_ptr, sm_scale, topk, x_topk, H=H, BLOCK_H=BLOCK_H, D_NOPE=D_NOPE,
+            D_ROPE=D_ROPE, SCALE_TILE=SCALE_TILE, PAGE_SIZE=PAGE_SIZE,
+            BYTES_PER_PAGE=BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+            SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+            S_OFFSET_BYTES=S_OFFSET_BYTES, X_PAGE_SIZE=X_PAGE_SIZE,
+            X_BYTES_PER_PAGE=X_BYTES_PER_PAGE, X_S_OFFSET_BYTES=X_S_OFFSET_BYTES,
+            BLOCK_N=BLOCK_N, HAS_EXTRA=HAS_EXTRA, HAS_SINK=HAS_SINK, IDX64=IDX64,
+            QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX, ABL_LOAD=ABL_LOAD,
+            ABL_DOT=ABL_DOT, ABL_SCALE=ABL_SCALE,
+        )
+
+
+@triton.jit
+def _nsa_decode_split_paged_fp8_native_kernel(
+    q_ptr,
+    fp8_ptr,
+    bf16_ptr,
+    u8_ptr,
+    idx_ptr,
+    len_ptr,
+    x_fp8_ptr,
+    x_bf16_ptr,
+    x_u8_ptr,
+    x_idx_ptr,
+    x_len_ptr,
+    mid_o_ptr,
+    mid_m_ptr,
+    mid_l_ptr,
+    sm_scale,
+    topk,
+    x_topk,
+    splits,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    SCALE_TILE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    X_PAGE_SIZE: tl.constexpr,
+    X_BYTES_PER_PAGE: tl.constexpr,
+    X_S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    IDX64: tl.constexpr,
+    QK_SCALED: tl.constexpr,
+    PV_ROWMAX: tl.constexpr,
+    ABL_SCALE: tl.constexpr,
+):
+    _native_split_program(
+        tl.program_id(0), tl.program_id(1), tl.program_id(2), q_ptr, fp8_ptr,
+        bf16_ptr, u8_ptr, idx_ptr, len_ptr, x_fp8_ptr, x_bf16_ptr, x_u8_ptr,
+        x_idx_ptr, x_len_ptr, mid_o_ptr, mid_m_ptr, mid_l_ptr, sm_scale, topk,
+        x_topk, splits, H=H, BLOCK_H=BLOCK_H, D_NOPE=D_NOPE, D_ROPE=D_ROPE,
+        SCALE_TILE=SCALE_TILE, PAGE_SIZE=PAGE_SIZE,
+        BYTES_PER_PAGE=BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+        SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+        S_OFFSET_BYTES=S_OFFSET_BYTES, X_PAGE_SIZE=X_PAGE_SIZE,
+        X_BYTES_PER_PAGE=X_BYTES_PER_PAGE, X_S_OFFSET_BYTES=X_S_OFFSET_BYTES,
+        BLOCK_N=BLOCK_N, HAS_EXTRA=HAS_EXTRA, IDX64=IDX64,
+        QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX, ABL_SCALE=ABL_SCALE,
+    )
+
+
+@triton.jit
+def _nsa_decode_split_paged_fp8_native_persistent_kernel(
+    n_items,
+    T,
+    q_ptr,
+    fp8_ptr,
+    bf16_ptr,
+    u8_ptr,
+    idx_ptr,
+    len_ptr,
+    x_fp8_ptr,
+    x_bf16_ptr,
+    x_u8_ptr,
+    x_idx_ptr,
+    x_len_ptr,
+    mid_o_ptr,
+    mid_m_ptr,
+    mid_l_ptr,
+    sm_scale,
+    topk,
+    x_topk,
+    splits,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    SCALE_TILE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    X_PAGE_SIZE: tl.constexpr,
+    X_BYTES_PER_PAGE: tl.constexpr,
+    X_S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    IDX64: tl.constexpr,
+    QK_SCALED: tl.constexpr,
+    PV_ROWMAX: tl.constexpr,
+    ABL_SCALE: tl.constexpr,
+):
+    # See the unsplit persistent kernel for why the step is 1 and not `nprog`.
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    for i in tl.range(0, tl.cdiv(n_items - pid, nprog), loop_unroll_factor=1):
+        wi = pid + i * nprog
+        rem = wi // T
+        _native_split_program(
+                wi % T, rem % splits, rem // splits, q_ptr, fp8_ptr, bf16_ptr, u8_ptr,
+                idx_ptr, len_ptr, x_fp8_ptr, x_bf16_ptr, x_u8_ptr, x_idx_ptr,
+                x_len_ptr, mid_o_ptr, mid_m_ptr, mid_l_ptr, sm_scale, topk, x_topk,
+                splits, H=H, BLOCK_H=BLOCK_H, D_NOPE=D_NOPE, D_ROPE=D_ROPE,
+                SCALE_TILE=SCALE_TILE, PAGE_SIZE=PAGE_SIZE,
+                BYTES_PER_PAGE=BYTES_PER_PAGE, ROW_BYTES=ROW_BYTES,
+                SCALE_BYTES_PER_TOKEN=SCALE_BYTES_PER_TOKEN,
+                S_OFFSET_BYTES=S_OFFSET_BYTES, X_PAGE_SIZE=X_PAGE_SIZE,
+                X_BYTES_PER_PAGE=X_BYTES_PER_PAGE, X_S_OFFSET_BYTES=X_S_OFFSET_BYTES,
+                BLOCK_N=BLOCK_N, HAS_EXTRA=HAS_EXTRA, IDX64=IDX64,
+                QK_SCALED=QK_SCALED, PV_ROWMAX=PV_ROWMAX, ABL_SCALE=ABL_SCALE,
+        )
 
 
 # Split-count and tile policy for the native paged-fp8 arm. Everything this
@@ -3798,6 +4308,82 @@ _MAX_WAVES_NATIVE = 1  # waves of `_BLOCKS_PER_SM` blocks before splitting loses
 # inside a captured graph; it exists so that a tile sweep can tell a config that
 # ran from one that silently stepped down to a smaller tile.
 _LAUNCH_INFO = {}
+
+# H1 -- the persistent grid. **Measured 1.0063x on the production decode mix,
+# and kept off.** Thread blocks per SM for the persistent launch; 0 keeps the
+# ordinary one-program-per-work-item grid. See `_native_launch` and the
+# `persistent` argument of `sparse_mla_prefill_paged_fp8_native`.
+#
+# The case for it was NCU's work-distribution rule on the B=128 decode capture:
+# `Waves Per SM 3.05`, "3 full waves and a partial wave of 8 thread blocks"
+# (Est. Speedup 25%), SM active-cycle imbalance +13.45% / -2.80% (Est. 11.6%),
+# and `SM Active 526,136 / Elapsed 611,461 = 86.0%` as the honest ceiling.
+#
+# **It cannot work, and the arithmetic says so before the stopwatch does.** Wave
+# quantisation is a *granularity* effect, and a grid-stride loop does not change
+# granularity -- it changes who dispatches a block, not how much work a block
+# holds. At B=128 the grid is 512 uniform items over 84 x 2 = 168 resident
+# slots. The ordinary launch retires an item and the hardware drops the next
+# block straight into the freed slot, so the makespan is ceil(512/168) = 4
+# item-times. The persistent launch hands 8 blocks four items and 160 blocks
+# three, so the makespan is also 4 item-times, and it leaves the same 8 SMs
+# holding a 7th item: +14.84% above the mean, against NCU's measured +13.45%.
+# The two are identical at 256, 512 and 1024 items alike.
+#
+# Measured on RTX 5080 / sm_120 / 84 SMs at H=64, topk=640, pool 16,384, page
+# 256, `splits="auto"`, CUDA-graph replay (probe/sau_ncu_h1h2.py, job 3829569),
+# as speedup over the ordinary launch:
+#
+#     B         1      2      4      8     16     32     64    128    256
+#   bpsm=2  0.999  1.000  0.999  1.000  1.029  1.024  1.002  1.028  1.045
+#   bpsm=1  1.000  1.000  0.857  0.834  0.758  0.729  0.706  0.712  0.683
+#
+# The run carries its own control. Below B=64 the grid is *smaller than one
+# wave*, so `min(items, sm * bpsm)` launches the same number of blocks and the
+# persistent kernel is the ordinary kernel with a trip-count-1 loop -- no tail
+# exists to be killed. That control reads 1.0265x (B=16, 32); the three
+# genuinely ragged cells read 1.0250x. Killing the tail is therefore worth
+# **0.9985x**, and the ~2.5% is a codegen accident of wrapping the body in a
+# loop, available at any batch size and unrelated to the hypothesis. Over the
+# production mix -- 94% of issued decode steps are B <= 16, where the grid does
+# not fill one wave -- the whole thing is 1.0063x.
+#
+# `bpsm=1` is the same experiment at half the resident blocks and loses 30%,
+# which is the double-capped occupancy showing up exactly where it should.
+#
+# The lever that *does* reach the tail is finer work items, and it was swept at
+# the three ragged cells (probe/sau_ncu_h1h2_close.py, job 3829673). Best S
+# against the shipped S=1: **1.104x at B=64 (S=3), 1.057x at B=128 (S=2), and
+# 1.043x at B=256 (S=1, i.e. nothing)** -- so even the right lever tops out at
+# ~10%, not NCU's 25%, and past S=3 the partial traffic and the merge take it
+# back (B=256 at S=5 is 0.745x). It is left unclaimed because `auto_splits`
+# already refuses it and B >= 64 is 0% of issued decode steps.
+#
+# Bitwise: a work item is a whole program -- its own online-softmax state from
+# -inf to its own epilogue, nothing shared with the other items a block runs --
+# so both persistent kernels are `torch.equal` to their ordinary counterparts at
+# every batch size measured, on both the split and the unsplit path. Head tiling
+# within one layout family stays bit-identical, `splits=1` stays bit for bit the
+# unsplit kernel, and the compiled shared memory is unchanged at 48,384 B.
+# Kept in the file, off, because the estimate was large and the mechanism is
+# worth not re-deriving.
+_PERSISTENT_NATIVE: int = 0
+
+
+def _native_launch(device, persistent, items, T, kernel, pkernel, grid):
+    """Pick the ordinary launch or the persistent one, and its grid.
+
+    The persistent grid is capped at the work-item count, so it degenerates to
+    the ordinary launch (one item per block, loop runs once) rather than
+    spawning idle blocks whenever the work is smaller than the device. That is
+    also why H1 cannot help below a full wave: at the decode batch sizes that
+    dominate production the grid is already smaller than
+    ``sm_count * blocks_per_sm`` and the two launches are the same launch.
+    """
+    if persistent <= 0:
+        return kernel, grid, ()
+    sm = torch.cuda.get_device_properties(device).multi_processor_count
+    return pkernel, (min(items, sm * persistent),), (items, T)
 
 
 def _native_config(device, num_heads):
@@ -3882,8 +4468,20 @@ def _native_head_tile(device, num_heads, mono, override=None):
     return max(1, min(triton.next_power_of_2(tile), mono))
 
 
-def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile):
+def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile,
+                      row_stride=None):
     """Three aliased views of one pool, plus its byte strides.
+
+    ``row_stride`` overrides the natural ``d_nope + 2*d_rope`` distance between
+    consecutive rows of a page, for a pool written with padding between rows.
+    It exists for **H2**: NCU reports "only 22.0 of the 32 bytes transmitted per
+    sector are utilized" and attributes it to row bases that are not
+    sector-aligned. The natural stride here is 448 + 128 = **576 B = 18 x 32 B
+    = 9 x 64 B**, so the premise is false on this layout -- rows are already
+    sector- and 64 B-aligned, and it is the one-byte-per-row ue8m0 footer gather
+    that spends 28% of the tile's sectors on 1/32 of a sector each. Padding to
+    640 B (5 x 128 B) is measurable through this argument anyway, so the claim
+    is settled with a stopwatch instead of an argument.
 
     Page interior is ``[P x row_bytes data][P x scale_bytes footer]``; a row is
     ``d_nope`` fp8 bytes then ``d_rope`` bf16 (DSv4: 448 + 128 = 576 B), and the
@@ -3916,7 +4514,7 @@ def _paged_fp8_layout(cache, page_size, d_nope, d_rope, scale_tile):
     # dimension is dense. `view(torch.uint8)` rescales the strides with the
     # dtype, so `u8.stride(0)` is the page-to-page distance in bytes whatever
     # the rank is.
-    row_bytes = d_nope + d_rope * 2
+    row_bytes = int(row_stride or (d_nope + d_rope * 2))
     return (
         u8.view(_FP8_DTYPE),
         u8.view(torch.bfloat16),
@@ -3952,8 +4550,11 @@ def sparse_mla_prefill_paged_fp8_native(
     pv_rowmax=True,
     splits=1,
     partial_dtype=torch.bfloat16,
+    row_bytes=None,
+    persistent=None,
     _abl_load=False,
     _abl_dot=False,
+    _abl_scale=0,
 ):
     """Sparse-MLA prefill read straight off one or two paged fp8 KV pools.
 
@@ -3985,6 +4586,16 @@ def sparse_mla_prefill_paged_fp8_native(
             algebraically identical, not bitwise, because the softmax is
             reassociated and the partials round to ``partial_dtype``.
         partial_dtype: element type of the ``[T, H, splits, D]`` partial output.
+        row_bytes: override for the byte distance between consecutive rows of a
+            page, for a pool written with padding. ``None`` is the natural
+            ``d_nope + 2*d_rope``. See `_paged_fp8_layout`.
+        persistent: thread blocks per SM for the **persistent** launch (H1).
+            ``None``/``0`` keeps the ordinary grid, one program per work item.
+            Anything above 0 launches ``min(work_items, sm_count * persistent)``
+            blocks that grid-stride the work items themselves, so the last wave
+            is never a fraction of one. Bitwise identical either way -- a work
+            item is a whole program and nothing crosses between them. Falls back
+            to the module default `_PERSISTENT_NATIVE`.
     """
     if not _has_fp8_mma(q.device):
         cap = torch.cuda.get_device_capability(q.device)
@@ -4020,8 +4631,9 @@ def sparse_mla_prefill_paged_fp8_native(
             f"scale_tile={scale_tile}."
         )
 
+    persistent = int(_PERSISTENT_NATIVE if persistent is None else persistent)
     fp8_p, bf16_p, u8_p, bpp, row_bytes, sbpt, s_off = _paged_fp8_layout(
-        quant_k_cache, page_size, d_nope, d_rope, scale_tile
+        quant_k_cache, page_size, d_nope, d_rope, scale_tile, row_bytes
     )
     has_extra = extra_cache is not None
     if has_extra:
@@ -4030,7 +4642,7 @@ def sparse_mla_prefill_paged_fp8_native(
                 "extra_cache needs extra_indices and extra_page_size as well."
             )
         x_fp8, x_bf16, x_u8, x_bpp, _, _, x_s_off = _paged_fp8_layout(
-            extra_cache, extra_page_size, d_nope, d_rope, scale_tile
+            extra_cache, extra_page_size, d_nope, d_rope, scale_tile, row_bytes
         )
         extra_indices = extra_indices.contiguous()
         if extra_topk_length is None:
@@ -4101,13 +4713,19 @@ def sparse_mla_prefill_paged_fp8_native(
         # `_nsa_decode_split_paged_fp8_native_kernel`. `splits <= 1` leaves the
         # path below bit for bit unchanged.
         mid_o, mid_m, mid_l = _split_ws(q.device, T, h, splits, D, partial_dtype)
+        items = T * splits * triton.cdiv(h, block_h)
+        kern, grid, lead = _native_launch(
+            q.device, persistent, items, T,
+            _nsa_decode_split_paged_fp8_native_kernel,
+            _nsa_decode_split_paged_fp8_native_persistent_kernel,
+            (T, splits, triton.cdiv(h, block_h)),
+        )
         for bn_try, ns_try in _smem_fallbacks(bn, stages):
             if bn_try < 32:
                 continue
             try:
-                _nsa_decode_split_paged_fp8_native_kernel[
-                    (T, splits, triton.cdiv(h, block_h))
-                ](
+                kern[grid](
+                    *lead,
                     q, fp8_p, bf16_p, u8_p, indices, topk_length,
                     x_fp8, x_bf16, x_u8, extra_indices, extra_topk_length,
                     mid_o, mid_m, mid_l,
@@ -4135,8 +4753,10 @@ def sparse_mla_prefill_paged_fp8_native(
                     IDX64=idx64,
                     QK_SCALED=bool(qk_scaled),
                     PV_ROWMAX=bool(pv_rowmax),
+                    ABL_SCALE=int(_abl_scale),
                 )
                 _LAUNCH_INFO["native_split"] = (bn_try, warps, ns_try, block_h)
+                _LAUNCH_INFO["native_split_grid"] = (grid, items)
                 break
             except triton.runtime.errors.OutOfResources:
                 continue
@@ -4147,11 +4767,19 @@ def sparse_mla_prefill_paged_fp8_native(
         _merge_launch(mid_o, mid_m, mid_l, out, attn_sink, T, h, D, splits)
         return out
 
+    items = T * triton.cdiv(h, block_h)
+    kern, grid, lead = _native_launch(
+        q.device, persistent, items, T,
+        _nsa_prefill_paged_fp8_native_kernel,
+        _nsa_prefill_paged_fp8_native_persistent_kernel,
+        (T, triton.cdiv(h, block_h)),
+    )
     for bn_try, ns_try in _smem_fallbacks(bn, stages):
         if bn_try < 32:
             continue
         try:
-            _nsa_prefill_paged_fp8_native_kernel[(T, triton.cdiv(h, block_h))](
+            kern[grid](
+                *lead,
                 q,
                 fp8_p,
                 bf16_p,
@@ -4191,8 +4819,10 @@ def sparse_mla_prefill_paged_fp8_native(
                 PV_ROWMAX=bool(pv_rowmax),
                 ABL_LOAD=bool(_abl_load),
                 ABL_DOT=bool(_abl_dot),
+                ABL_SCALE=int(_abl_scale),
             )
             _LAUNCH_INFO["native_unsplit"] = (bn_try, warps, ns_try, block_h)
+            _LAUNCH_INFO["native_unsplit_grid"] = (grid, items)
             return out
         except triton.runtime.errors.OutOfResources:
             continue
