@@ -1638,7 +1638,23 @@ def _union_path(
         # and G=4 -> GH=32 both select what they selected before.
         bn, warps, stages = (64, 4, 3) if G * h <= 16 else (32, 4, 2)
     else:
-        bn, warps, stages = (64, 4, 2) if G == 4 else (64, 8, 2)
+        # Same G-vs-G*h mis-keying as the sm_120 branch above, measured on an
+        # H20-3e (sm_90, 78 SMs, 232,448 B smem optin). No OOR here -- GH=32 at
+        # BN=64 needs 102,400 B and fits -- so this is pure mistuning: 8 warps
+        # is a GH=16 config and GH=32 wants 4. Against the per-token path:
+        #
+        #     arrival        GH   ships     now      best            best
+        #     G=4, h=8       32   (64,4,2)  1.346x   (64,4,2)        1.350x
+        #     G=2, h=8       16   (64,8,2)  1.351x   (32,4,2)        1.363x
+        #     G=2, h=16      32   (64,8,2)  0.714x   (64,4,2)        0.867x
+        #
+        # so h=8 is unchanged either way and h=16 recovers 21%. Union still
+        # should not run at h=16 (0.867x is a loss), but as a ceiling, not a
+        # cliff -- on sm_90 `_narrow_h` is False, so BLOCK_H is 16 at h=8 too,
+        # and the base path's half-empty tile is exactly what the union trades
+        # away. Measured on H20-3e, which is a cut-down Hopper; the ranking has
+        # not been re-checked on H100/H200.
+        bn, warps, stages = (64, 8, 2) if G * h <= 16 else (64, 4, 2)
     # The union Q tile is H*G rows, so its shared-memory footprint grows with
     # the head count: 16 heads at G=2 already exceeds SM120's 100 KB with the
     # tuned tile. Step down as the per-token launcher does rather than failing
