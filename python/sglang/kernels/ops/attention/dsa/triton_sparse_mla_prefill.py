@@ -1287,7 +1287,29 @@ def _dense_prefix_path(
 # 16 takes essentially all of it; 64 buys 0.6 pp more floor for four times the
 # staleness window, which is not a trade worth making.
 ## Set to 0 or None to restore the ungated all-or-nothing behaviour.
-_UNION_GATE = 1.9
+#
+# The threshold is per (G, H), not a constant. The condition is
+#
+#     union wins  <=>  |U| * c_union(G*H)  <  G * K * c_base(H)
+#                 <=>  r  <  G * c_base(H) / c_union(G*H)
+#
+# and BOTH cost terms move with the configuration -- `c_base` with the head
+# count, `c_union` with the whole M tile. A single number is only right for the
+# (G, H) it was fitted at. Marginal cost per gathered row, measured on the
+# shipped kernels (ns, RTX 5080; probe/logs/sau_union_cost_3829693.out):
+#
+#     M      GLM union   GLM base    DSv4 union   DSv4 base
+#      8       0.448      0.402        0.396       0.381
+#     16       0.624      0.655        0.580       0.599
+#     32       0.813      0.807        0.809       0.734
+#
+# giving  G=4,H=8 -> 1.98 / 1.88   G=2,H=16 -> 1.61 / 1.48   G=2,H=8 -> 1.29 / 1.31
+# for GLM / DSv4 respectively. The entries below take the lower (DSv4) side, so
+# the gate errs toward declining on the shape with less to amortise.
+#
+# Using the G=4 number everywhere -- which this did at first -- leaves the gate
+# 28% too permissive at G=2, i.e. keeping the path in a band where it loses.
+_UNION_GATE = 1.9  # fallback for an (arch, G, H) with no measured entry
 
 # What the gate last saw. Host-side only, so it costs nothing on the device and
 # nothing inside a captured graph; it exists so a sweep can tell a call that was
@@ -1478,7 +1500,10 @@ def _union_path(
     # tuple, and sharing it silently made this cache read one key and write
     # another -- every call came back a miss, which showed up as the refresh
     # interval having no effect at all.
-    gate_key = (G, K, q.device)
+    # `h` is in the key because the decision is not a property of (G, K) alone:
+    # the break-even depends on the head count, and two head counts sharing one
+    # cached decision would let a 16-head call reuse an 8-head verdict.
+    gate_key = (G, K, h, q.device)
     fresh = True
     if union_gate:
         seen, decision = _UNION_GATE_CACHE.get(gate_key, (0, None))
@@ -1594,10 +1619,24 @@ def _union_path(
     if union_config is not None:
         bn, warps, stages = union_config
     elif torch.cuda.get_device_capability(q.device)[0] >= 12:
-        # SM120 on-box sweeps: G=2 winner (64,4,3) 5.21 vs 5.50; G=4 winner (32,4,2)
-        # 3.605 ms on real indices (BN=64 OORs >=115KB with the GH=32 Q tile; BN=32
-        # restores the fit and the M=32 x N=32 tile beats every neighbor by >=12%).
-        bn, warps, stages = (64, 4, 3) if G == 2 else (32, 4, 2)
+        # SM120 on-box sweeps: GH=16 winner (64,4,3) 5.21 vs 5.50; GH=32 winner
+        # (32,4,2) 3.605 ms on real indices (BN=64 OORs with the GH=32 Q tile;
+        # BN=32 restores the fit and the M=32 x N=32 tile beats every neighbor
+        # by >=12%).
+        #
+        # Keyed on G*h, not G: the constraint is the tile, and the tile is GH.
+        # Keying on G alone was right only while h was 8 -- it silently assumed
+        # G=2 meant GH=16. At h=16 (TP=4 without DP attention) G=2 is GH=32, so
+        # it picked BN=64, which is exactly the OOR this comment describes, and
+        # fell down `_smem_fallbacks` -- which walks bn/stages but never warps.
+        # Measured on the DSv4 shape at h=16 (job 4069998), against per-token:
+        #
+        #     (64,4,3) picked by the old keying   0.460x   <- OOR, then fallback
+        #     (32,4,2) picked by this keying      0.970x
+        #
+        # i.e. the mis-keying cost 2.1x. It changes nothing at h=8: G=2 -> GH=16
+        # and G=4 -> GH=32 both select what they selected before.
+        bn, warps, stages = (64, 4, 3) if G * h <= 16 else (32, 4, 2)
     else:
         bn, warps, stages = (64, 4, 2) if G == 4 else (64, 8, 2)
     # The union Q tile is H*G rows, so its shared-memory footprint grows with
