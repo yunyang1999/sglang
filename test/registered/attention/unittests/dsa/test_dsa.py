@@ -253,8 +253,8 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
     # noise — same separation principle as the DSV4 SWA fixture so a
     # silent pack/write bug cannot corrupt both paths identically.
     #
-    # FP8 + `flashmla_sparse` prefill + EXTEND + non-empty prefix is the
-    # only combo that hits `TopkTransformMethod.RAGGED`
+    # FP8 + `flashmla_sparse` prefill + EXTEND (or MIXED) + non-empty prefix
+    # is the only combo that hits `TopkTransformMethod.RAGGED`
     # (`get_topk_transform_method`), which exercises
     # `dequantize_k_cache_paged` and the `topk_indices_offset` shift —
     # paths that the BF16 default suite never reaches.
@@ -302,6 +302,31 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                     else self.FP8_PREFILL_PAGED_CASE
                 )
                 run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)
+
+    # A mixed-chunk batch: one chunk of a long prefill plus decode requests
+    # appended as one-token extends (`--enable-mixed-chunk`). It runs the
+    # prefill impl like EXTEND but carries ForwardMode.MIXED, so the backend
+    # must route it exactly like EXTEND: the prefill graph runner builds the
+    # attention metadata from the MIXED batch and replays EXTEND graphs, and
+    # context-parallel / NPU runs hand MIXED straight to forward_extend. On
+    # PAGED the bf16-only sparse prefill kernels receive the packed FP8 pool.
+    FP8_MIXED_CASE = DSAAttentionCase(
+        name="dsa_sparse_fp8_mixed_chunk",
+        backend="dsa",
+        forward_mode=ForwardMode.MIXED,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(2048, 2048, 2048),
+        extend_lens=(4, 1, 1),
+    )
+
+    def test_sparse_fp8_mixed_chunk_prefill_cases(self):
+        for impl in DSA_PREFILL_IMPL_VARIANTS:
+            with self.subTest(impl=impl):
+                run_dsa_sparse_fp8_prefill_case(
+                    self, self.FP8_MIXED_CASE, dsa_prefill_backend=impl
+                )
 
     def test_sparse_fp8_decode_cases(self):
         for impl in DSA_DECODE_IMPL_VARIANTS:

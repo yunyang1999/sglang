@@ -2699,8 +2699,9 @@ class DeepseekSparseAttnBackend(
         """
         if self.dsa_prefill_impl != "flashmla_sparse_q8":
             return False
-        # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
-        # target-verify and draft-extend, which use dsa_decode_impl anyway).
+        # Born-fp8 q is EXTEND-only. MIXED routes RAGGED as well but stays on
+        # the bf16-q hand-off (the helper casts); decode/idle, target-verify and
+        # draft-extend use dsa_decode_impl.
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return False
         # Per-batch dense fallback (il <= threshold) reads bf16 q directly.
@@ -3798,15 +3799,16 @@ class DeepseekSparseAttnBackend(
         if (
             # disable for MTP
             self.dsa_kv_cache_store_fp8
-            # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
-            # dispatch lives inside the RAGGED branch of forward_extend; without this the
-            # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
-            # fp8 KV ("kv must have dtype kBFloat16"). triton_sparse_mla is listed for
-            # the same reason: its dispatch also dequantizes inside the RAGGED branch
-            # and its kernel is bf16-only.
+            # These prefill kernels cannot read the packed FP8 pool; forward_extend
+            # dequantizes it (or takes the q8 path) only inside its RAGGED branch,
+            # so every batch that runs the prefill impl against an FP8 pool must
+            # route RAGGED. MIXED must answer exactly like EXTEND: the eager runner
+            # runs a mixed-chunk batch as EXTEND, and the prefill graph runner
+            # builds this metadata from the MIXED batch while replaying the
+            # EXTEND-captured graphs, whose in-graph ops see EXTEND.
             and self.dsa_prefill_impl
             in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla")
-            and forward_mode == ForwardMode.EXTEND
+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
